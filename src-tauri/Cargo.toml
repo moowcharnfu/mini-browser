@@ -1,0 +1,18 @@
+[package]
+name = "mini-browser"
+version = "1.0.0"
+description = "轻量级跨平台浏览器"
+authors = ["mini-browser"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["unstable", "devtools"] }
+serde = { version = "1", features = ["derive"] }
+url = "2.5"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

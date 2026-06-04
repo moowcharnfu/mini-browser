@@ -1,0 +1,43 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "mini-browser",
+  "version": "1.0.0",
+  "identifier": "com.mini-browser.app",
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run dev",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1421"
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {}
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Mini Browser",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: https://ipc.localhost; script-src 'self' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline' blob:; img-src 'self' data: https: http: blob:; font-src 'self' data:; connect-src 'self' ipc: https://ipc.localhost https: http: data: blob:; frame-src 'self' https: http: data: blob:; webview-src 'self' data: http: https: blob:; media-src 'self' https: http: blob: data:; object-src 'none';"
+    }
+  }
+}
