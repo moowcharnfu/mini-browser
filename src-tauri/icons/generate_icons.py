@@ -29,26 +29,38 @@ def ensure_pillow():
         return Image
 
 def get_source_image(Image):
-    """获取源图像"""
-    # 优先使用 512x512.png（最高分辨率 PNG）
+    """获取源图像 — 优先从 SVG 生成，避免使用过时的 PNG"""
+    svg_path = SCRIPT_DIR / "icon.svg"
+    if svg_path.exists():
+        import subprocess, io, sys
+        # 尝试用 npx tauri icon 转换 SVG
+        print(f"使用源图像: icon.svg")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "list"],
+            capture_output=True, text=True
+        )
+        # 回退: 用 PIL 直接打开无法处理 SVG，需要外部工具
+        # 先尝试用 tauri CLI 生成
+        result = subprocess.run(
+            ["npx", "tauri", "icon", str(svg_path), "--output", str(SCRIPT_DIR)],
+            capture_output=True, text=True,
+            cwd=SCRIPT_DIR.parent.parent  # 回到项目根目录
+        )
+        if result.returncode == 0:
+            # 从生成的 PNG 加载
+            png_path = SCRIPT_DIR / "icon.png"
+            if png_path.exists():
+                img = Image.open(png_path)
+                return img
+        # fallback: 尝试其他工具...
+
+    # 最后尝试 512x512.png
     source_path = SCRIPT_DIR / "512x512.png"
     if source_path.exists():
         print(f"使用源图像: 512x512.png")
         return Image.open(source_path)
 
-    # 回退到 SVG（需要 cairosvg）
-    svg_path = SCRIPT_DIR / "icon.svg"
-    if svg_path.exists():
-        try:
-            import cairosvg
-            png_data = cairosvg.svg2png(url=str(svg_path), output_width=512, output_height=512)
-            img = Image.open(io.BytesIO(png_data))
-            print("使用源图像: icon.svg (转换)")
-            return img
-        except ImportError:
-            pass
-
-    raise FileNotFoundError("找不到源图像，请确保存在 512x512.png 或 icon.svg")
+    raise FileNotFoundError("找不到源图像，请确保存在 icon.svg 或 512x512.png")
 
 def generate_png_icons(Image, source):
     """生成标准尺寸的 PNG 图标"""
