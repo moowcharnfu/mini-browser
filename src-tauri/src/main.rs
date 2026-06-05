@@ -222,7 +222,7 @@ fn create_tab(tab_id: i32, url: String, app: AppHandle) -> Result<(), String> {
     .incognito(true)
     .initialization_script(&(CTX_MENU_SCRIPT.to_owned() + &set_content_height_script + DBL_CLICK_SCRIPT))
     .on_navigation(move |url| {
-        debug_log!("[on_navigation] tab_id={} url={}", tab_id, url);
+        debug_log!("[on_navigation] tab_id={} url={} ALLOW={}", tab_id, url, true);
         let _ = nav_handle.emit(
             "browser://url-changed",
             UrlPayload {
@@ -235,12 +235,13 @@ fn create_tab(tab_id: i32, url: String, app: AppHandle) -> Result<(), String> {
     .on_page_load(move |_wv, payload| {
         let loading = matches!(payload.event(), PageLoadEvent::Started);
         let url_str = payload.url().to_string();
-        debug_log!("[on_page_load] tab_id={} loading={} url={}", tab_id, loading, url_str);
+        debug_log!("[on_page_load] tab_id={} event={:?} loading={} url={}", tab_id, payload.event(), loading, url_str);
         let _ = load_handle.emit(
             "browser://loading",
             LoadingPayload { tab_id, loading },
         );
         if !loading {
+            debug_log!("[on_page_load] FINISHED, emitting url-changed");
             let _ = load_handle.emit(
                 "browser://url-changed",
                 UrlPayload { tab_id, url: url_str },
@@ -312,12 +313,16 @@ fn navigate_to_url(tab_id: i32, url: String, app: AppHandle) {
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
     if let Some(webview) = pool_guard.get(tab_id) {
+        debug_log!("[navigate_to_url] found webview, navigating to: {}", url);
         // 使用原生 navigate API（比 eval 更可靠）
         if let Ok(parsed_url) = url::Url::parse(&url) {
-            let _ = webview.navigate(parsed_url);
+            let result = webview.navigate(parsed_url);
+            debug_log!("[navigate_to_url] navigate result: {:?}", result);
         } else {
             debug_log!("[navigate_to_url] invalid URL: {}", url);
         }
+    } else {
+        debug_log!("[navigate_to_url] webview not found for tab_id={}", tab_id);
     }
 }
 
