@@ -178,9 +178,10 @@ fn calc_content_size(physical_width: f64, physical_height: f64, scale: f64) -> (
 }
 
 /// 获取内容区域尺寸（从 Window 对象）
+/// 使用 inner_size()：macOS Overlay 和 Linux Visible 均适用
 fn get_content_size(window: &tauri::Window) -> (f64, f64) {
     let scale = window.scale_factor().unwrap_or(1.0);
-    let physical = window.outer_size().unwrap_or(PhysicalSize::new(1200, 800));
+    let physical = window.inner_size().unwrap_or(PhysicalSize::new(1200, 800));
     let size = calc_content_size(physical.width as f64, physical.height as f64, scale);
     debug_log!("[get_content_size] physical={}x{} scale={} logical={}x{}",
         physical.width, physical.height, scale, size.0, size.1);
@@ -389,6 +390,7 @@ fn main() {
                         let pool = resize_handle.state::<Arc<Mutex<WebViewPool>>>();
                         let pool_guard = pool.lock().unwrap();
                         let scale = win.scale_factor().unwrap_or(1.0);
+                        let physical = win.inner_size().unwrap_or(*physical);
                         let (content_width, content_height) =
                             calc_content_size(physical.width as f64, physical.height as f64, scale);
                         let active_id = pool_guard.active_tab_id;
