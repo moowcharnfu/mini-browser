@@ -483,21 +483,23 @@ export default function App() {
                 />
             )}
 
-            {/* 内容区域 — 由多个 content webview 覆盖 */}
+            {/* 内容区域 — 由多个 content webview 覆盖（透明，WebView 在下方显示） */}
             <div
                 style={{
                     flex: 1,
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    background: '#f0f0f0',
+                    background: 'transparent',
                     color: '#8080a0',
                     fontSize: 14,
                     overflow: 'hidden',
+                    position: 'relative',
                 }}
             >
+                {/* 占位内容仅在 about:blank 且无加载时显示 */}
                 {(!activeTab || activeTab.url === 'about:blank') && !loading && (
-                    <div style={{ textAlign: 'center' }}>
+                    <div style={{ textAlign: 'center', pointerEvents: 'none' }}>
                         <div style={{ fontSize: 48, opacity: 0.4, marginBottom: 16 }}>
                             🌐
                         </div>
