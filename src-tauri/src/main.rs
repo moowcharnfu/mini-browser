@@ -17,6 +17,7 @@ macro_rules! debug_log {
 }
 
 /// 中文右键菜单脚本（注入到每个 content webview）
+/// 使用 __mb_content_height 代替 window.innerHeight，避免跨平台差异
 const CTX_MENU_SCRIPT: &str = r#"(function(){
     function showMenu(e){
         e.preventDefault();
@@ -45,7 +46,8 @@ const CTX_MENU_SCRIPT: &str = r#"(function(){
         add('刷新',function(){window.location.reload()});
         add('复制',function(){try{navigator.clipboard.writeText(document.getSelection().toString())}catch(e){}});
         menu.style.left=Math.min(e.clientX,window.innerWidth-160)+'px';
-        menu.style.top=Math.min(e.clientY,window.innerHeight-200)+'px';
+        var contentH = window.__mb_content_height || window.innerHeight;
+        menu.style.top=Math.min(e.clientY, contentH - 200)+'px';
         if(document.body)document.body.appendChild(menu);
     }
     document.addEventListener('contextmenu',showMenu);
@@ -203,12 +205,18 @@ fn create_tab(tab_id: i32, url: String, app: AppHandle) -> Result<(), String> {
 
     let parsed_url = url.parse::<url::Url>().map_err(|e| format!("URL 解析失败: {}", e))?;
 
+    // 注入内容区域高度（跨平台一致），供右键菜单等脚本使用
+    let set_content_height_script = format!(
+        "window.__mb_content_height = {};",
+        content_height
+    );
+
     let builder = WebviewBuilder::new(
         format!("content-{}", tab_id),
         WebviewUrl::External(parsed_url),
     )
     .incognito(true)
-    .initialization_script(&(CTX_MENU_SCRIPT.to_owned() + DBL_CLICK_SCRIPT))
+    .initialization_script(&(CTX_MENU_SCRIPT.to_owned() + &set_content_height_script + DBL_CLICK_SCRIPT))
     .on_navigation(move |url| {
         debug_log!("[on_navigation] tab_id={} url={}", tab_id, url);
         let _ = nav_handle.emit(
@@ -392,6 +400,8 @@ fn main() {
                             };
                             let _ = webview.set_position(pos);
                             let _ = webview.set_size(LogicalSize::new(content_width, content_height));
+                            // 同步更新 __mb_content_height（右键菜单定位用）
+                            let _ = webview.eval(&format!("window.__mb_content_height = {};", content_height));
                         }
                     }
                 }
