@@ -174,6 +174,8 @@ fn calc_content_size(physical_width: f64, physical_height: f64, scale: f64) -> (
     let logical_width = physical_width / scale;
     let logical_height = physical_height / scale;
     let content_height = (logical_height - UI_CHROME_HEIGHT).max(100.0);
+    debug_log!("[calc_content_size] physical={}x{} scale={} logical={}x{} content={}x{}",
+        physical_width, physical_height, scale, logical_width, logical_height, logical_width, content_height);
     (logical_width, content_height)
 }
 
@@ -203,6 +205,7 @@ fn create_tab(tab_id: i32, url: String, app: AppHandle) -> Result<(), String> {
     let nav_handle = app.clone();
     let load_handle = app.clone();
     let (content_width, content_height) = get_content_size(&window);
+    debug_log!("[create_tab] content_size={}x{}", content_width, content_height);
 
     let parsed_url = url.parse::<url::Url>().map_err(|e| format!("URL 解析失败: {}", e))?;
 
