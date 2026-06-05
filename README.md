@@ -9,6 +9,10 @@
 | **macOS** | Node.js 18+, Rust, Xcode Command Line Tools (`xcode-select --install`) |
 | **Windows** | Node.js 18+, Rust, WebView2 (Win10 1803+ 已内置) |
 | **Linux** | Node.js 18+, Rust, `sudo apt install libwebkit2gtk-4.1-dev build-essential libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev` |
+```
+  #rust & tauri中国源
+  export RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static && export RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup && curl --proto '=https' --tlsv1.2 -sSf   https://sh.rustup.rs | sh
+  ```
 
 ### 安装依赖
 
