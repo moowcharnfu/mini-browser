@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{
     webview::PageLoadEvent, AppHandle, Emitter, Manager, LogicalPosition, LogicalSize,
-    PhysicalSize, WebviewBuilder, WebviewUrl, Webview, WindowEvent,
+    WebviewBuilder, WebviewUrl, Webview, WindowEvent,
 };
+use tauri::TitleBarStyle;
 
 /// 调试日志：仅在 debug 构建中输出
 macro_rules! debug_log {
@@ -17,7 +18,6 @@ macro_rules! debug_log {
 }
 
 /// 中文右键菜单脚本（注入到每个 content webview）
-/// 使用 __mb_content_height 代替 window.innerHeight，避免跨平台差异
 const CTX_MENU_SCRIPT: &str = r#"(function(){
     function showMenu(e){
         e.preventDefault();
@@ -78,17 +78,14 @@ const SUSPEND_SCRIPT: &str = r#"(function(){
     if (window.__mb_suspended) return;
     window.__mb_suspended = true;
 
-    // 保存原始 API
     window.__mb_orig_setTimeout = window.setTimeout;
     window.__mb_orig_setInterval = window.setInterval;
     window.__mb_orig_requestAnimationFrame = window.requestAnimationFrame;
 
-    // 通过覆盖来阻止新定时器
     window.setTimeout = function() { return -1; };
     window.setInterval = function() { return -1; };
     window.requestAnimationFrame = function() { return -1; };
 
-    // 暂停媒体
     document.querySelectorAll('video, audio').forEach(function(el) {
         if (!el.paused) {
             el.__mb_was_playing = true;
@@ -104,12 +101,10 @@ const RESUME_SCRIPT: &str = r#"(function(){
     if (!window.__mb_suspended) return;
     window.__mb_suspended = false;
 
-    // 恢复原始 API
     window.setTimeout = window.__mb_orig_setTimeout;
     window.setInterval = window.__mb_orig_setInterval;
     window.requestAnimationFrame = window.__mb_orig_requestAnimationFrame;
 
-    // 恢复媒体
     document.querySelectorAll('video, audio').forEach(function(el) {
         if (el.__mb_was_playing) {
             el.play().catch(function(){});
@@ -119,9 +114,6 @@ const RESUME_SCRIPT: &str = r#"(function(){
 
     console.log('[mini-browser] tab resumed');
 })();"#;
-
-/// Total height of the fixed UI chrome
-const UI_CHROME_HEIGHT: f64 = 132.0;
 
 #[derive(Clone, serde::Serialize)]
 struct UrlPayload {
@@ -139,6 +131,11 @@ struct LoadingPayload {
 struct WebViewPool {
     webviews: HashMap<i32, Webview>,
     active_tab_id: Option<i32>,
+    /// 内容区域在窗口中的位置（CSS 逻辑像素），由前端 ResizeObserver 实时更新
+    content_x: f64,
+    content_y: f64,
+    content_width: f64,
+    content_height: f64,
 }
 
 impl WebViewPool {
@@ -146,6 +143,10 @@ impl WebViewPool {
         WebViewPool {
             webviews: HashMap::with_capacity(MAX_TABS),
             active_tab_id: None,
+            content_x: 0.0,
+            content_y: 108.0,   // 初始 fallback，React 会立即覆盖
+            content_width: 1200.0,
+            content_height: 668.0, // 1200-132 = 1068, wait no: 800-132=668
         }
     }
 
@@ -169,30 +170,9 @@ impl WebViewPool {
     }
 }
 
-/// 计算内容区域尺寸（逻辑像素）
-fn calc_content_size(physical_width: f64, physical_height: f64, scale: f64) -> (f64, f64) {
-    let logical_width = physical_width / scale;
-    let logical_height = physical_height / scale;
-    let content_height = (logical_height - UI_CHROME_HEIGHT).max(100.0);
-    debug_log!("[calc_content_size] physical={}x{} scale={} logical={}x{} content={}x{}",
-        physical_width, physical_height, scale, logical_width, logical_height, logical_width, content_height);
-    (logical_width, content_height)
-}
-
-/// 获取内容区域尺寸（从 Window 对象）
-/// 使用 inner_size()：macOS Overlay 和 Linux Visible 均适用
-fn get_content_size(window: &tauri::Window) -> (f64, f64) {
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let physical = window.inner_size().unwrap_or(PhysicalSize::new(1200, 800));
-    let size = calc_content_size(physical.width as f64, physical.height as f64, scale);
-    debug_log!("[get_content_size] physical={}x{} scale={} logical={}x{}",
-        physical.width, physical.height, scale, size.0, size.1);
-    size
-}
-
 #[tauri::command]
-fn create_tab(tab_id: i32, url: String, app: AppHandle) -> Result<(), String> {
-    debug_log!("[create_tab] tab_id={} url={}", tab_id, url);
+fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64, app: AppHandle) -> Result<(), String> {
+    debug_log!("[create_tab] tab_id={} url={} pos={}x{} size={}x{}", tab_id, url, x, y, width, height);
 
     let window = match app.get_window("main") {
         Some(w) => w,
@@ -204,15 +184,13 @@ fn create_tab(tab_id: i32, url: String, app: AppHandle) -> Result<(), String> {
 
     let nav_handle = app.clone();
     let load_handle = app.clone();
-    let (content_width, content_height) = get_content_size(&window);
-    debug_log!("[create_tab] content_size={}x{}", content_width, content_height);
 
     let parsed_url = url.parse::<url::Url>().map_err(|e| format!("URL 解析失败: {}", e))?;
 
-    // 注入内容区域高度（跨平台一致），供右键菜单等脚本使用
+    // 注入内容区域高度（右键菜单定位用）
     let set_content_height_script = format!(
         "window.__mb_content_height = {};",
-        content_height
+        height
     );
 
     let builder = WebviewBuilder::new(
@@ -252,8 +230,8 @@ fn create_tab(tab_id: i32, url: String, app: AppHandle) -> Result<(), String> {
     let webview = window
         .add_child(
             builder,
-            LogicalPosition::new(0.0, UI_CHROME_HEIGHT),
-            LogicalSize::new(content_width, content_height),
+            LogicalPosition::new(x, y),
+            LogicalSize::new(width, height),
         )
         .map_err(|e| format!("创建 WebView 失败: {}", e))?;
 
@@ -288,9 +266,11 @@ fn activate_tab(active_tab_id: i32, app: AppHandle) {
         }
     }
 
-    // 显示新活跃 tab
+    // 使用 pool 中存储的内容区域位置显示新 tab
+    let cx = pool_guard.content_x;
+    let cy = pool_guard.content_y;
     if let Some(wv) = pool_guard.webviews.get(&active_tab_id) {
-        let _ = wv.set_position(LogicalPosition::new(0.0, UI_CHROME_HEIGHT));
+        let _ = wv.set_position(LogicalPosition::new(cx, cy));
         let _ = wv.eval("document.documentElement.style.visibility='visible'; document.documentElement.style.opacity='1'; document.documentElement.style.pointerEvents='auto';");
         let _ = wv.eval(RESUME_SCRIPT);
     }
@@ -302,7 +282,6 @@ fn close_tab(tab_id: i32, app: AppHandle) {
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let mut pool_guard = pool.lock().unwrap();
     if let Some(webview) = pool_guard.remove(tab_id) {
-        // 关闭 webview
         let _ = webview.close();
     }
 }
@@ -314,7 +293,6 @@ fn navigate_to_url(tab_id: i32, url: String, app: AppHandle) {
     let pool_guard = pool.lock().unwrap();
     if let Some(webview) = pool_guard.get(tab_id) {
         debug_log!("[navigate_to_url] found webview, navigating to: {}", url);
-        // 使用原生 navigate API（比 eval 更可靠）
         if let Ok(parsed_url) = url::Url::parse(&url) {
             let result = webview.navigate(parsed_url);
             debug_log!("[navigate_to_url] navigate result: {:?}", result);
@@ -366,6 +344,34 @@ fn open_devtools_tab(tab_id: i32, app: AppHandle) {
     }
 }
 
+/// 前端 ResizeObserver 检测到内容区域尺寸变化时调用
+/// 同步更新所有 WebView 的位置和尺寸
+#[tauri::command]
+fn resize_content_area(x: f64, y: f64, width: f64, height: f64, app: AppHandle) {
+    debug_log!("[resize_content_area] pos={}x{} size={}x{}", x, y, width, height);
+    let pool = app.state::<Arc<Mutex<WebViewPool>>>();
+    let mut pool_guard = pool.lock().unwrap();
+
+    // 更新存储的内容区域位置
+    pool_guard.content_x = x;
+    pool_guard.content_y = y;
+    pool_guard.content_width = width;
+    pool_guard.content_height = height;
+
+    let active_id = pool_guard.active_tab_id;
+    for (&tab_id, webview) in &pool_guard.webviews {
+        let pos = if active_id == Some(tab_id) {
+            LogicalPosition::new(x, y)
+        } else {
+            LogicalPosition::new(-99999.0, -99999.0)
+        };
+        let _ = webview.set_position(pos);
+        let _ = webview.set_size(LogicalSize::new(width, height));
+        // 同步更新右键菜单定位用的 __mb_content_height
+        let _ = webview.eval(&format!("window.__mb_content_height = {};", height));
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(Arc::new(Mutex::new(WebViewPool::new())))
@@ -378,42 +384,36 @@ fn main() {
             go_back_tab,
             go_forward_tab,
             open_devtools_tab,
+            resize_content_area,
         ])
         .setup(|app| {
             debug_log!("[setup] initializing mini browser with multi-webview");
 
-            // 复用 create_tab 创建初始 tab
-            create_tab(1, "about:blank".into(), app.app_handle().clone())
+            // macOS: 使用 Overlay 标题栏风格（无边框透明标题栏）
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(window) = app.get_window("main") {
+                    let _ = window.set_decorations(false);
+                    let _ = window.set_title_bar_style(TitleBarStyle::Overlay);
+                    debug_log!("[setup] macOS: decorations removed, titlebar overlay");
+                }
+            }
+
+            // 创建初始 tab（使用 fallback 尺寸，React 会立即通过 resize_content_area 纠正）
+            create_tab(1, "about:blank".into(), 0.0, 108.0, 1200.0, 668.0, app.app_handle().clone())
                 .unwrap_or_else(|e| panic!("创建初始 tab 失败: {}", e));
 
-            // 激活初始 tab（确保可见性状态正确）
+            // 激活初始 tab
             activate_tab(1, app.app_handle().clone());
 
-            // 窗口 resize 时同步所有 WebView
+            // 窗口 resize 时同步所有 WebView 尺寸（React 的 ResizeObserver 已经处理此逻辑）
+            // 保留监听器仅用于调试信息
             let window = app.get_window("main").expect("main window not found");
-            let resize_handle = app.app_handle().clone();
             window.on_window_event(move |event| {
                 if let WindowEvent::Resized(physical) = event {
-                    if let Some(win) = resize_handle.get_window("main") {
-                        let pool = resize_handle.state::<Arc<Mutex<WebViewPool>>>();
-                        let pool_guard = pool.lock().unwrap();
-                        let scale = win.scale_factor().unwrap_or(1.0);
-                        let physical = win.inner_size().unwrap_or(*physical);
-                        let (content_width, content_height) =
-                            calc_content_size(physical.width as f64, physical.height as f64, scale);
-                        let active_id = pool_guard.active_tab_id;
-                        for (&tab_id, webview) in &pool_guard.webviews {
-                            let pos = if active_id == Some(tab_id) {
-                                LogicalPosition::new(0.0, UI_CHROME_HEIGHT)
-                            } else {
-                                LogicalPosition::new(-99999.0, -99999.0)
-                            };
-                            let _ = webview.set_position(pos);
-                            let _ = webview.set_size(LogicalSize::new(content_width, content_height));
-                            // 同步更新 __mb_content_height（右键菜单定位用）
-                            let _ = webview.eval(&format!("window.__mb_content_height = {};", content_height));
-                        }
-                    }
+                    debug_log!("[on_window_event::Resized] physical={}x{}", physical.width, physical.height);
+                    // 注意：React 端的 ResizeObserver 会检测到 flex 布局变化并调用 resize_content_area
+                    // 因此 Rust 端不需要再做任何计算
                 }
             });
 

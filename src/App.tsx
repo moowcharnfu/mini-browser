@@ -39,6 +39,7 @@ export default function App() {
     tabsRef.current = tabs;
     const activeTabIdRef = useRef(activeTabId);
     activeTabIdRef.current = activeTabId;
+    const contentRef = useRef<HTMLDivElement>(null);
 
     // Listen for URL changes from content webviews
     useEffect(() => {
@@ -74,6 +75,27 @@ export default function App() {
             }
         });
         return () => { unlisten.then((f) => f()); };
+    }, []);
+
+    // 监听内容区域尺寸变化，实时同步到 Rust（替代硬编码 chrome 高度计算）
+    useEffect(() => {
+        const el = contentRef.current;
+        if (!el) return;
+
+        const sendContentSize = () => {
+            const rect = el.getBoundingClientRect();
+            invoke('resize_content_area', {
+                x: rect.left,
+                y: rect.top,
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+            }).catch(console.error);
+        };
+
+        sendContentSize();
+        const observer = new ResizeObserver(sendContentSize);
+        observer.observe(el);
+        return () => observer.disconnect();
     }, []);
 
     const navigate = useCallback(async (url?: string) => {
@@ -129,8 +151,18 @@ export default function App() {
     const newTab = useCallback(async () => {
         const id = newTabId(tabsRef.current);
         try {
+            // 获取当前内容区域的实际位置和大小
+            const el = contentRef.current;
+            const rect = el?.getBoundingClientRect();
             // 创建新 WebView
-            await invoke('create_tab', { tabId: id, url: 'about:blank' });
+            await invoke('create_tab', {
+                tabId: id,
+                url: 'about:blank',
+                x: rect?.left ?? 0,
+                y: rect?.top ?? 108,
+                width: Math.round(rect?.width ?? 1200),
+                height: Math.round(rect?.height ?? 668),
+            });
             // 添加到 React 状态
             setTabs((prev) => [...prev, defaultTab(id)]);
             setActiveTabId(id);
@@ -483,30 +515,30 @@ export default function App() {
                 />
             )}
 
-            {/* 内容区域 — 由多个 content webview 覆盖（透明，WebView 在下方显示） */}
+            {/* 内容区域 — 始终存在用于测量，由 content webview 覆盖 */}
             <div
+                ref={contentRef}
                 style={{
                     flex: 1,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    background: 'transparent',
-                    color: '#8080a0',
-                    fontSize: 14,
-                    overflow: 'hidden',
-                    position: 'relative',
+                    background: '#0f0f1a',
                 }}
             >
-                {/* 占位内容仅在 about:blank 且无加载时显示 */}
                 {(!activeTab || activeTab.url === 'about:blank') && !loading && (
-                    <div style={{ textAlign: 'center', pointerEvents: 'none' }}>
-                        <div style={{ fontSize: 48, opacity: 0.4, marginBottom: 16 }}>
-                            🌐
+                    <div style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        height: '100%',
+                    }}>
+                        <div style={{ textAlign: 'center' }}>
+                            <div style={{ fontSize: 48, opacity: 0.4, marginBottom: 16 }}>
+                                🌐
+                            </div>
+                            <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>
+                                迷你浏览器
+                            </h2>
+                            <p>输入网址开始浏览</p>
                         </div>
-                        <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>
-                            迷你浏览器
-                        </h2>
-                        <p>输入网址开始浏览</p>
                     </div>
                 )}
             </div>
