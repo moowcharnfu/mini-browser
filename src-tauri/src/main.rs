@@ -321,11 +321,17 @@ fn open_devtools_tab(tab_id: i32, app: AppHandle) {
 #[tauri::command]
 fn resize_content_area(x: f64, y: f64, width: f64, height: f64, app: AppHandle) {
     debug_log!("[resize_content_area] pos={}x{} size={}x{}", x, y, width, height);
-    if height <= 0.0 || width <= 0.0 {
-        return;
-    }
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let mut pool_guard = pool.lock().unwrap();
+
+    if height <= 0.0 || width <= 0.0 {
+        // 内容区域不可见（如窗口最小化），隐藏所有子窗口
+        debug_log!("[resize_content_area] content area hidden, hiding all webviews");
+        for (_, w) in &pool_guard.windows {
+            let _ = w.hide();
+        }
+        return;
+    }
 
     // 更新存储的内容区域位置
     pool_guard.content_x = x;
@@ -379,7 +385,7 @@ fn main() {
 
             // 不再在 setup 阶段提前创建 tab，由前端 ResizeObserver 首次回调时创建
 
-            // 监听主窗口 resize 事件（仅用于调试，React 端会处理实际布局）
+            // 监听主窗口 resize / close 事件
             let window = app.get_window("main").expect("main window not found");
             let close_app = app.handle().clone();
             window.on_window_event(move |event| {

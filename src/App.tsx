@@ -103,24 +103,29 @@ export default function App() {
             if (initRef.current) return;
             initRef.current = true;
 
-            // 延迟一帧确保 resize_content_area 已在 Rust 端生效
-            setTimeout(async () => {
-                const id = newTabId([]);
-                const r = contentRef.current?.getBoundingClientRect();
-                const wp = await appWindow.innerPosition();
-                invoke('create_tab', {
-                    tabId: id,
-                    url: 'about:blank',
-                    x: (r?.left ?? 0) + wp.x,
-                    y: (r?.top ?? 0) + wp.y,
-                    width: Math.round(r?.width ?? 1200),
-                    height: Math.round(r?.height ?? 800),
-                }).then(() => {
-                    setTabs([defaultTab(id)]);
-                    setActiveTabId(id);
-                    return invoke('activate_tab', { activeTabId: id });
-                }).catch(console.error);
-            }, 16);
+            // 等待两帧确保布局完全稳定（跨平台兼容）
+            const scheduleCreate = () => {
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(async () => {
+                        const id = newTabId([]);
+                        const r = contentRef.current?.getBoundingClientRect();
+                        const wp = await appWindow.innerPosition();
+                        invoke('create_tab', {
+                            tabId: id,
+                            url: 'about:blank',
+                            x: (r?.left ?? 0) + wp.x,
+                            y: (r?.top ?? 0) + wp.y,
+                            width: Math.round(r?.width ?? 1200),
+                            height: Math.round(r?.height ?? 800),
+                        }).then(() => {
+                            setTabs([defaultTab(id)]);
+                            setActiveTabId(id);
+                            return invoke('activate_tab', { activeTabId: id });
+                        }).catch(console.error);
+                    });
+                });
+            };
+            scheduleCreate();
         });
         observer.observe(el);
         return () => observer.disconnect();
@@ -179,10 +184,8 @@ export default function App() {
     const newTab = useCallback(async () => {
         const id = newTabId(tabsRef.current);
         try {
-            // 获取当前内容区域的实际位置和大小（实时 DOM 坐标，确保跨平台兼容）
             const el = contentRef.current;
             const rect = el?.getBoundingClientRect();
-            // 创建新 WebView
             const wp = await appWindow.innerPosition();
             await invoke('create_tab', {
                 tabId: id,
@@ -192,12 +195,18 @@ export default function App() {
                 width: Math.round(rect?.width ?? 1200),
                 height: Math.round(rect?.height ?? 800),
             });
-            // 添加到 React 状态
             setTabs((prev) => [...prev, defaultTab(id)]);
             setActiveTabId(id);
             setLoading(false);
-            // 激活新 tab：隐藏其他 WebView，显示新 WebView
+            // 等待一帧确保 React 状态更新 + 布局稳定
+            await new Promise<void>(resolve => {
+                requestAnimationFrame(resolve);
+            });
             await invoke('activate_tab', { activeTabId: id });
+            // 额外等待一帧确保 WebView 真正显示
+            await new Promise<void>(resolve => {
+                requestAnimationFrame(resolve);
+            });
         } catch (err) {
             console.error('[newTab] failed:', err);
             alert(`无法创建新标签：${err}`);
@@ -217,8 +226,12 @@ export default function App() {
             if (next) {
                 setActiveTabId(next.id);
                 setLoading(next.url !== 'about:blank');
-                // 等 React 状态更新后再刷新内容区域坐标并激活 tab
-                await new Promise(r => setTimeout(r, 16));
+                // 等待两帧确保布局完全稳定（跨平台兼容）
+                await new Promise<void>(resolve => {
+                    requestAnimationFrame(() => {
+                        requestAnimationFrame(resolve);
+                    });
+                });
                 const el = contentRef.current;
                 const rect = el?.getBoundingClientRect();
                 if (rect) {
@@ -232,6 +245,10 @@ export default function App() {
                 }
                 // 激活 WebView（显示）
                 await invoke('activate_tab', { activeTabId: next.id });
+                // 额外等待一帧确保 WebView 真正显示
+                await new Promise<void>(resolve => {
+                    requestAnimationFrame(resolve);
+                });
             }
         }
     }, []);
@@ -242,8 +259,12 @@ export default function App() {
             if (url !== undefined) {
                 setLoading(url !== 'about:blank');
             }
-            // 等 React 状态更新后刷新坐标再激活
-            await new Promise(r => setTimeout(r, 16));
+            // 等待两帧确保布局完全稳定（跨平台兼容：macOS WKWebView / Windows WebView2 / Linux WebKitGTK）
+            await new Promise<void>(resolve => {
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(resolve);
+                });
+            });
             const el = contentRef.current;
             const rect = el?.getBoundingClientRect();
             if (rect) {
@@ -256,6 +277,10 @@ export default function App() {
                 });
             }
             await invoke('activate_tab', { activeTabId: id });
+            // 额外等待一帧确保 WebView 真正显示（show() + set_position() + set_focus() 需要时间生效）
+            await new Promise<void>(resolve => {
+                requestAnimationFrame(resolve);
+            });
         },
         [],
     );
@@ -278,8 +303,41 @@ export default function App() {
         );
     }, []);
 
-    const minimizeWindow = useCallback(() => {
-        appWindow.minimize().catch(console.error);
+    // 监听主窗口尺寸变化，检测从最小化恢复
+    useEffect(() => {
+        const unlisten = appWindow.onResized(async () => {
+            const minimized = await appWindow.isMinimized();
+            if (!minimized && activeTabIdRef.current) {
+                // 窗口从最小化恢复，重新发送内容区域尺寸
+                const el = contentRef.current;
+                if (!el) return;
+                const rect = el.getBoundingClientRect();
+                const wp = await appWindow.innerPosition();
+                invoke('resize_content_area', {
+                    x: wp.x + rect.left,
+                    y: wp.y + rect.top,
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                }).catch(console.error);
+            }
+        });
+        return () => { unlisten.then((f) => f()); };
+    }, []);
+
+    const minimizeWindow = useCallback(async () => {
+        // 最小化前隐藏子窗口，防止它们独立显示在屏幕上
+        const el = contentRef.current;
+        if (el) {
+            const rect = el.getBoundingClientRect();
+            const wp = await appWindow.innerPosition();
+            await invoke('resize_content_area', {
+                x: wp.x + rect.left,
+                y: wp.y + rect.top,
+                width: 0,
+                height: 0,
+            }).catch(console.error);
+        }
+        await appWindow.minimize();
     }, []);
 
     const toggleMaximize = useCallback(() => {
@@ -322,7 +380,6 @@ export default function App() {
         >
             {/* 标题栏 */}
             <div
-                data-tauri-drag-region
                 style={{
                     display: 'flex',
                     alignItems: 'center',
@@ -330,12 +387,15 @@ export default function App() {
                     background: '#1a1a2e',
                     borderBottom: '1px solid #2d2d4a',
                     flexShrink: 0,
-                    paddingLeft: 70,
                 }}
             >
-                <div style={{ flex: 1, height: '100%' }} />
+                {/* 空白区域：用于窗口拖动 */}
                 <div
-                    data-tauri-drag-region="false"
+                    data-tauri-drag-region
+                    style={{ flex: 1, height: '100%' }}
+                />
+                {/* 按钮区域：不设 data-tauri-drag-region，确保点击正常 */}
+                <div
                     style={{
                         display: 'flex',
                         gap: 8,
