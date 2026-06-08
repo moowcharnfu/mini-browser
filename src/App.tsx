@@ -28,8 +28,8 @@ function defaultTab(id: number): Tab {
 }
 
 export default function App() {
-    const [tabs, setTabs] = useState<Tab[]>([defaultTab(1)]);
-    const [activeTabId, setActiveTabId] = useState(1);
+    const [tabs, setTabs] = useState<Tab[]>([]);
+    const [activeTabId, setActiveTabId] = useState(0);
     const [loading, setLoading] = useState(false);
 
     const activeTab = tabs.find((t) => t.id === activeTabId);
@@ -40,6 +40,7 @@ export default function App() {
     const activeTabIdRef = useRef(activeTabId);
     activeTabIdRef.current = activeTabId;
     const contentRef = useRef<HTMLDivElement>(null);
+    const initRef = useRef(false);
 
     // Listen for URL changes from content webviews
     useEffect(() => {
@@ -78,22 +79,49 @@ export default function App() {
     }, []);
 
     // 监听内容区域尺寸变化，实时同步到 Rust（替代硬编码 chrome 高度计算）
+    // 同时用于跨平台首次初始化：首次回调时创建初始 tab，确保坐标准确
     useEffect(() => {
         const el = contentRef.current;
         if (!el) return;
 
-        const sendContentSize = () => {
+        const sendContentSize = async () => {
             const rect = el.getBoundingClientRect();
+            const wp = await appWindow.innerPosition();
             invoke('resize_content_area', {
-                x: rect.left,
-                y: rect.top,
+                x: wp.x + rect.left,
+                y: wp.y + rect.top,
                 width: Math.round(rect.width),
                 height: Math.round(rect.height),
             }).catch(console.error);
         };
 
-        sendContentSize();
-        const observer = new ResizeObserver(sendContentSize);
+        sendContentSize().catch(console.error);
+
+        const observer = new ResizeObserver(() => {
+            sendContentSize().catch(console.error);
+            // 使用 ref 确保只创建一次，避免 ResizeObserver 多次触发的竞态
+            if (initRef.current) return;
+            initRef.current = true;
+
+            // 延迟一帧确保 resize_content_area 已在 Rust 端生效
+            setTimeout(async () => {
+                const id = newTabId([]);
+                const r = contentRef.current?.getBoundingClientRect();
+                const wp = await appWindow.innerPosition();
+                invoke('create_tab', {
+                    tabId: id,
+                    url: 'about:blank',
+                    x: (r?.left ?? 0) + wp.x,
+                    y: (r?.top ?? 0) + wp.y,
+                    width: Math.round(r?.width ?? 1200),
+                    height: Math.round(r?.height ?? 800),
+                }).then(() => {
+                    setTabs([defaultTab(id)]);
+                    setActiveTabId(id);
+                    return invoke('activate_tab', { activeTabId: id });
+                }).catch(console.error);
+            }, 16);
+        });
         observer.observe(el);
         return () => observer.disconnect();
     }, []);
@@ -151,17 +179,18 @@ export default function App() {
     const newTab = useCallback(async () => {
         const id = newTabId(tabsRef.current);
         try {
-            // 获取当前内容区域的实际位置和大小
+            // 获取当前内容区域的实际位置和大小（实时 DOM 坐标，确保跨平台兼容）
             const el = contentRef.current;
             const rect = el?.getBoundingClientRect();
             // 创建新 WebView
+            const wp = await appWindow.innerPosition();
             await invoke('create_tab', {
                 tabId: id,
                 url: 'about:blank',
-                x: rect?.left ?? 0,
-                y: rect?.top ?? 108,
+                x: (rect?.left ?? 0) + wp.x,
+                y: (rect?.top ?? 0) + wp.y,
                 width: Math.round(rect?.width ?? 1200),
-                height: Math.round(rect?.height ?? 668),
+                height: Math.round(rect?.height ?? 800),
             });
             // 添加到 React 状态
             setTabs((prev) => [...prev, defaultTab(id)]);
@@ -188,6 +217,19 @@ export default function App() {
             if (next) {
                 setActiveTabId(next.id);
                 setLoading(next.url !== 'about:blank');
+                // 等 React 状态更新后再刷新内容区域坐标并激活 tab
+                await new Promise(r => setTimeout(r, 16));
+                const el = contentRef.current;
+                const rect = el?.getBoundingClientRect();
+                if (rect) {
+                    const wp = await appWindow.innerPosition();
+                    await invoke('resize_content_area', {
+                        x: wp.x + rect.left,
+                        y: wp.y + rect.top,
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                    });
+                }
                 // 激活 WebView（显示）
                 await invoke('activate_tab', { activeTabId: next.id });
             }
@@ -199,6 +241,19 @@ export default function App() {
             setActiveTabId(id);
             if (url !== undefined) {
                 setLoading(url !== 'about:blank');
+            }
+            // 等 React 状态更新后刷新坐标再激活
+            await new Promise(r => setTimeout(r, 16));
+            const el = contentRef.current;
+            const rect = el?.getBoundingClientRect();
+            if (rect) {
+                const wp = await appWindow.innerPosition();
+                await invoke('resize_content_area', {
+                    x: wp.x + rect.left,
+                    y: wp.y + rect.top,
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                });
             }
             await invoke('activate_tab', { activeTabId: id });
         },
@@ -233,6 +288,10 @@ export default function App() {
 
     const handleAddressKeyDown = useCallback((e: React.KeyboardEvent) => {
         if (e.key === 'Enter') navigate();
+    }, []);
+
+    const closeWindow = useCallback(() => {
+        appWindow.close().catch(console.error);
     }, []);
 
     const btnStyle: React.CSSProperties = {
@@ -288,6 +347,16 @@ export default function App() {
                     </button>
                     <button onClick={toggleMaximize} style={btnStyle}>
                         □
+                    </button>
+                    <button
+                        onClick={closeWindow}
+                        style={{
+                            ...btnStyle,
+                            color: '#f87171',
+                            fontSize: 16,
+                        }}
+                    >
+                        ×
                     </button>
                 </div>
             </div>
@@ -515,7 +584,7 @@ export default function App() {
                 />
             )}
 
-            {/* 内容区域 — 始终存在用于测量，由 content webview 覆盖 */}
+            {/* 内容区域 — 用于测量坐标，子窗口会精确覆盖此区域 */}
             <div
                 ref={contentRef}
                 style={{

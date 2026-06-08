@@ -4,9 +4,25 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{
     webview::PageLoadEvent, AppHandle, Emitter, Manager, LogicalPosition, LogicalSize,
-    WebviewBuilder, WebviewUrl, Webview, WindowEvent,
+    WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
+#[cfg(target_os = "macos")]
 use tauri::TitleBarStyle;
+
+/// 生成当前平台的 User-Agent 字符串
+fn platform_user_agent() -> String {
+    let platform = if cfg!(target_os = "macos") {
+        "Macintosh; Intel Mac OS X 10_15_7"
+    } else if cfg!(target_os = "windows") {
+        "Windows NT 10.0; Win64; x64"
+    } else {
+        "X11; Linux x86_64"
+    };
+    format!(
+        "Mozilla/5.0 ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        platform
+    )
+}
 
 /// 调试日志：仅在 debug 构建中输出
 macro_rules! debug_log {
@@ -73,48 +89,6 @@ const DBL_CLICK_SCRIPT: &str = r#"(function(){
 /// 最大标签数量限制
 const MAX_TABS: usize = 10;
 
-/// 睡眠脚本：暂停后台 WebView 的 JS 执行
-const SUSPEND_SCRIPT: &str = r#"(function(){
-    if (window.__mb_suspended) return;
-    window.__mb_suspended = true;
-
-    window.__mb_orig_setTimeout = window.setTimeout;
-    window.__mb_orig_setInterval = window.setInterval;
-    window.__mb_orig_requestAnimationFrame = window.requestAnimationFrame;
-
-    window.setTimeout = function() { return -1; };
-    window.setInterval = function() { return -1; };
-    window.requestAnimationFrame = function() { return -1; };
-
-    document.querySelectorAll('video, audio').forEach(function(el) {
-        if (!el.paused) {
-            el.__mb_was_playing = true;
-            el.pause();
-        }
-    });
-
-    console.log('[mini-browser] tab suspended');
-})();"#;
-
-/// 恢复脚本：恢复前台 WebView 的 JS 执行
-const RESUME_SCRIPT: &str = r#"(function(){
-    if (!window.__mb_suspended) return;
-    window.__mb_suspended = false;
-
-    window.setTimeout = window.__mb_orig_setTimeout;
-    window.setInterval = window.__mb_orig_setInterval;
-    window.requestAnimationFrame = window.__mb_orig_requestAnimationFrame;
-
-    document.querySelectorAll('video, audio').forEach(function(el) {
-        if (el.__mb_was_playing) {
-            el.play().catch(function(){});
-            el.__mb_was_playing = false;
-        }
-    });
-
-    console.log('[mini-browser] tab resumed');
-})();"#;
-
 #[derive(Clone, serde::Serialize)]
 struct UrlPayload {
     tab_id: i32,
@@ -127,9 +101,9 @@ struct LoadingPayload {
     loading: bool,
 }
 
-/// 存储所有 WebView 的句柄
+/// 存储所有子窗口的句柄
 struct WebViewPool {
-    webviews: HashMap<i32, Webview>,
+    windows: HashMap<i32, tauri::WebviewWindow>,
     active_tab_id: Option<i32>,
     /// 内容区域在窗口中的位置（CSS 逻辑像素），由前端 ResizeObserver 实时更新
     content_x: f64,
@@ -141,32 +115,38 @@ struct WebViewPool {
 impl WebViewPool {
     fn new() -> Self {
         WebViewPool {
-            webviews: HashMap::with_capacity(MAX_TABS),
+            windows: HashMap::with_capacity(MAX_TABS),
             active_tab_id: None,
             content_x: 0.0,
-            content_y: 108.0,   // 初始 fallback，React 会立即覆盖
+            content_y: 0.0,
             content_width: 1200.0,
-            content_height: 668.0, // 1200-132 = 1068, wait no: 800-132=668
+            content_height: 800.0,
         }
     }
 
-    fn insert(&mut self, tab_id: i32, webview: Webview) {
-        self.webviews.insert(tab_id, webview);
+    fn insert(&mut self, tab_id: i32, window: tauri::WebviewWindow) {
+        self.windows.insert(tab_id, window);
     }
 
-    fn get(&self, tab_id: i32) -> Option<&Webview> {
-        self.webviews.get(&tab_id)
+    fn get(&self, tab_id: i32) -> Option<&tauri::WebviewWindow> {
+        self.windows.get(&tab_id)
     }
 
-    fn remove(&mut self, tab_id: i32) -> Option<Webview> {
+    fn remove(&mut self, tab_id: i32) -> Option<tauri::WebviewWindow> {
         if self.active_tab_id == Some(tab_id) {
             self.active_tab_id = None;
         }
-        self.webviews.remove(&tab_id)
+        self.windows.remove(&tab_id)
     }
 
     fn len(&self) -> usize {
-        self.webviews.len()
+        self.windows.len()
+    }
+
+    /// 从子窗口获取 WebView handle
+    fn get_webview(&self, tab_id: i32) -> Option<tauri::Webview> {
+        let label = format!("content-{}", tab_id);
+        self.windows.get(&tab_id).and_then(|w| w.get_webview(&label))
     }
 }
 
@@ -174,76 +154,70 @@ impl WebViewPool {
 fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64, app: AppHandle) -> Result<(), String> {
     debug_log!("[create_tab] tab_id={} url={} pos={}x{} size={}x{}", tab_id, url, x, y, width, height);
 
-    let window = match app.get_window("main") {
-        Some(w) => w,
-        None => {
-            debug_log!("[create_tab] main window not found");
-            return Err("main window not found".into());
-        }
-    };
-
-    let nav_handle = app.clone();
-    let load_handle = app.clone();
-
+    let label = format!("content-{}", tab_id);
     let parsed_url = url.parse::<url::Url>().map_err(|e| format!("URL 解析失败: {}", e))?;
 
-    // 注入内容区域高度（右键菜单定位用）
-    let set_content_height_script = format!(
-        "window.__mb_content_height = {};",
-        height
-    );
+    let height_script = format!("window.__mb_content_height = {};", height);
+    let init_script = CTX_MENU_SCRIPT.to_owned() + &height_script + DBL_CLICK_SCRIPT;
 
-    let builder = WebviewBuilder::new(
-        format!("content-{}", tab_id),
-        WebviewUrl::External(parsed_url),
-    )
-    .incognito(true)
-    .initialization_script(&(CTX_MENU_SCRIPT.to_owned() + &set_content_height_script + DBL_CLICK_SCRIPT))
-    .on_navigation(move |url| {
-        debug_log!("[on_navigation] tab_id={} url={} ALLOW={}", tab_id, url, true);
-        let _ = nav_handle.emit(
-            "browser://url-changed",
-            UrlPayload {
-                tab_id,
-                url: url.to_string(),
-            },
-        );
-        true
-    })
-    .on_page_load(move |_wv, payload| {
-        let loading = matches!(payload.event(), PageLoadEvent::Started);
-        let url_str = payload.url().to_string();
-        debug_log!("[on_page_load] tab_id={} event={:?} loading={} url={}", tab_id, payload.event(), loading, url_str);
-        let _ = load_handle.emit(
-            "browser://loading",
-            LoadingPayload { tab_id, loading },
-        );
-        if !loading {
-            debug_log!("[on_page_load] FINISHED, emitting url-changed");
-            let _ = load_handle.emit(
+    // 使用 WebviewWindowBuilder 创建子窗口
+    // 子窗口无装饰、不可调整大小、无阴影，与主窗口 content 区域精确对齐
+    let nav_handle = app.clone();
+    let load_handle = app.clone();
+    let nav_tab_id = tab_id;
+    let load_tab_id = tab_id;
+    let nav_app = app.clone();
+
+    let window = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(parsed_url))
+        .user_agent(&platform_user_agent())
+        .initialization_script(&init_script)
+        .incognito(true)
+        .decorations(false)
+        .resizable(false)
+        .shadow(false)
+        .on_navigation(move |url| {
+            debug_log!("[on_navigation] tab_id={} url={} ALLOW={}", nav_tab_id, url, true);
+            let _ = nav_app.emit(
                 "browser://url-changed",
-                UrlPayload { tab_id, url: url_str },
+                UrlPayload {
+                    tab_id: nav_tab_id,
+                    url: url.to_string(),
+                },
             );
-        }
-    });
+            true
+        })
+        .on_page_load(move |_ww, payload| {
+            let loading = matches!(payload.event(), PageLoadEvent::Started);
+            let url_str = payload.url().to_string();
+            debug_log!("[on_page_load] tab_id={} event={:?} loading={} url={}", load_tab_id, payload.event(), loading, url_str);
+            let _ = load_handle.emit(
+                "browser://loading",
+                LoadingPayload { tab_id: load_tab_id, loading },
+            );
+            if !loading {
+                debug_log!("[on_page_load] FINISHED, emitting url-changed");
+                let _ = nav_handle.emit(
+                    "browser://url-changed",
+                    UrlPayload { tab_id: load_tab_id, url: url_str },
+                );
+            }
+        })
+        .build()
+        .map_err(|e| format!("创建子窗口失败: {}", e))?;
 
-    let webview = window
-        .add_child(
-            builder,
-            LogicalPosition::new(x, y),
-            LogicalSize::new(width, height),
-        )
-        .map_err(|e| format!("创建 WebView 失败: {}", e))?;
+    // 设置位置和大小
+    let _ = window.set_position(LogicalPosition::new(x, y));
+    let _ = window.set_size(LogicalSize::new(width, height));
 
-    // 存入全局状态（持有锁时二次检查，避免 TOCTOU）
+    // 存入全局状态
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     {
         let mut pool_guard = pool.lock().unwrap();
         if pool_guard.len() >= MAX_TABS {
-            let _ = webview.close();
+            let _ = window.close();
             return Err(format!("达到最大标签数量限制 ({})", MAX_TABS));
         }
-        pool_guard.insert(tab_id, webview);
+        pool_guard.insert(tab_id, window);
     }
     Ok(())
 }
@@ -256,23 +230,21 @@ fn activate_tab(active_tab_id: i32, app: AppHandle) {
 
     let prev_active = pool_guard.active_tab_id.replace(active_tab_id);
 
-    // 只隐藏前一个活跃 tab
+    // 隐藏前一个活跃 tab 的子窗口
     if let Some(prev_id) = prev_active {
         if prev_id != active_tab_id {
-            if let Some(wv) = pool_guard.webviews.get(&prev_id) {
-                let _ = wv.set_position(LogicalPosition::new(-99999.0, -99999.0));
-                let _ = wv.eval(SUSPEND_SCRIPT);
+            if let Some(w) = pool_guard.windows.get(&prev_id) {
+                let _ = w.hide();
             }
         }
     }
 
-    // 使用 pool 中存储的内容区域位置显示新 tab
-    let cx = pool_guard.content_x;
-    let cy = pool_guard.content_y;
-    if let Some(wv) = pool_guard.webviews.get(&active_tab_id) {
-        let _ = wv.set_position(LogicalPosition::new(cx, cy));
-        let _ = wv.eval("document.documentElement.style.visibility='visible'; document.documentElement.style.opacity='1'; document.documentElement.style.pointerEvents='auto';");
-        let _ = wv.eval(RESUME_SCRIPT);
+    // 显示当前 tab 的子窗口
+    if let Some(w) = pool_guard.windows.get(&active_tab_id) {
+        let _ = w.set_position(LogicalPosition::new(pool_guard.content_x, pool_guard.content_y));
+        let _ = w.set_size(LogicalSize::new(pool_guard.content_width, pool_guard.content_height));
+        let _ = w.show();
+        let _ = w.set_focus();
     }
 }
 
@@ -281,8 +253,8 @@ fn close_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[close_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let mut pool_guard = pool.lock().unwrap();
-    if let Some(webview) = pool_guard.remove(tab_id) {
-        let _ = webview.close();
+    if let Some(window) = pool_guard.remove(tab_id) {
+        let _ = window.close();
     }
 }
 
@@ -291,10 +263,10 @@ fn navigate_to_url(tab_id: i32, url: String, app: AppHandle) {
     debug_log!("[navigate_to_url] tab_id={} url={}", tab_id, url);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
-    if let Some(webview) = pool_guard.get(tab_id) {
+    if let Some(wv) = pool_guard.get_webview(tab_id) {
         debug_log!("[navigate_to_url] found webview, navigating to: {}", url);
         if let Ok(parsed_url) = url::Url::parse(&url) {
-            let result = webview.navigate(parsed_url);
+            let result = wv.navigate(parsed_url);
             debug_log!("[navigate_to_url] navigate result: {:?}", result);
         } else {
             debug_log!("[navigate_to_url] invalid URL: {}", url);
@@ -309,8 +281,8 @@ fn reload_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[reload_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
-    if let Some(webview) = pool_guard.get(tab_id) {
-        let _ = webview.eval("window.location.reload();");
+    if let Some(wv) = pool_guard.get_webview(tab_id) {
+        let _ = wv.eval("window.location.reload();");
     }
 }
 
@@ -319,8 +291,8 @@ fn go_back_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[go_back_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
-    if let Some(webview) = pool_guard.get(tab_id) {
-        let _ = webview.eval("window.history.back();");
+    if let Some(wv) = pool_guard.get_webview(tab_id) {
+        let _ = wv.eval("window.history.back();");
     }
 }
 
@@ -329,8 +301,8 @@ fn go_forward_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[go_forward_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
-    if let Some(webview) = pool_guard.get(tab_id) {
-        let _ = webview.eval("window.history.forward();");
+    if let Some(wv) = pool_guard.get_webview(tab_id) {
+        let _ = wv.eval("window.history.forward();");
     }
 }
 
@@ -339,16 +311,19 @@ fn open_devtools_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[open_devtools_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
-    if let Some(webview) = pool_guard.get(tab_id) {
-        webview.open_devtools();
+    if let Some(wv) = pool_guard.get_webview(tab_id) {
+        wv.open_devtools();
     }
 }
 
 /// 前端 ResizeObserver 检测到内容区域尺寸变化时调用
-/// 同步更新所有 WebView 的位置和尺寸
+/// 同步更新所有子窗口的位置和尺寸
 #[tauri::command]
 fn resize_content_area(x: f64, y: f64, width: f64, height: f64, app: AppHandle) {
     debug_log!("[resize_content_area] pos={}x{} size={}x{}", x, y, width, height);
+    if height <= 0.0 || width <= 0.0 {
+        return;
+    }
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let mut pool_guard = pool.lock().unwrap();
 
@@ -359,16 +334,15 @@ fn resize_content_area(x: f64, y: f64, width: f64, height: f64, app: AppHandle) 
     pool_guard.content_height = height;
 
     let active_id = pool_guard.active_tab_id;
-    for (&tab_id, webview) in &pool_guard.webviews {
-        let pos = if active_id == Some(tab_id) {
-            LogicalPosition::new(x, y)
+    for (&tab_id, window) in &pool_guard.windows {
+        let is_active = active_id == Some(tab_id);
+        if is_active {
+            let _ = window.set_position(LogicalPosition::new(x, y));
+            let _ = window.set_size(LogicalSize::new(width, height));
+            let _ = window.set_focus();
         } else {
-            LogicalPosition::new(-99999.0, -99999.0)
-        };
-        let _ = webview.set_position(pos);
-        let _ = webview.set_size(LogicalSize::new(width, height));
-        // 同步更新右键菜单定位用的 __mb_content_height
-        let _ = webview.eval(&format!("window.__mb_content_height = {};", height));
+            let _ = window.hide();
+        }
     }
 }
 
@@ -387,33 +361,38 @@ fn main() {
             resize_content_area,
         ])
         .setup(|app| {
-            debug_log!("[setup] initializing mini browser with multi-webview");
+            debug_log!("[setup] initializing mini browser with child-window approach");
 
-            // macOS: 使用 Overlay 标题栏风格（无边框透明标题栏）
-            #[cfg(target_os = "macos")]
-            {
-                if let Some(window) = app.get_window("main") {
-                    let _ = window.set_decorations(false);
+            // 所有平台统一去除原生窗口装饰，由前端完全控制布局
+            if let Some(window) = app.get_window("main") {
+                let _ = window.set_decorations(false);
+                #[cfg(target_os = "macos")]
+                {
                     let _ = window.set_title_bar_style(TitleBarStyle::Overlay);
                     debug_log!("[setup] macOS: decorations removed, titlebar overlay");
                 }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    debug_log!("[setup] decorations removed for cross-platform consistency");
+                }
             }
 
-            // 创建初始 tab（使用 fallback 尺寸，React 会立即通过 resize_content_area 纠正）
-            create_tab(1, "about:blank".into(), 0.0, 108.0, 1200.0, 668.0, app.app_handle().clone())
-                .unwrap_or_else(|e| panic!("创建初始 tab 失败: {}", e));
+            // 不再在 setup 阶段提前创建 tab，由前端 ResizeObserver 首次回调时创建
 
-            // 激活初始 tab
-            activate_tab(1, app.app_handle().clone());
-
-            // 窗口 resize 时同步所有 WebView 尺寸（React 的 ResizeObserver 已经处理此逻辑）
-            // 保留监听器仅用于调试信息
+            // 监听主窗口 resize 事件（仅用于调试，React 端会处理实际布局）
             let window = app.get_window("main").expect("main window not found");
+            let close_app = app.handle().clone();
             window.on_window_event(move |event| {
                 if let WindowEvent::Resized(physical) = event {
                     debug_log!("[on_window_event::Resized] physical={}x{}", physical.width, physical.height);
-                    // 注意：React 端的 ResizeObserver 会检测到 flex 布局变化并调用 resize_content_area
-                    // 因此 Rust 端不需要再做任何计算
+                }
+                if let WindowEvent::CloseRequested { .. } = event {
+                    debug_log!("[on_window_event::CloseRequested] cleaning up child windows");
+                    let pool = close_app.state::<Arc<Mutex<WebViewPool>>>();
+                    let pool_guard = pool.lock().unwrap();
+                    for (_, w) in &pool_guard.windows {
+                        let _ = w.close();
+                    }
                 }
             });
 
