@@ -1,13 +1,11 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tauri::{
-    webview::PageLoadEvent, AppHandle, Emitter, Manager, LogicalPosition, LogicalSize,
-    WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    webview::{PageLoadEvent, WebviewBuilder},
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WindowEvent,
 };
-#[cfg(target_os = "macos")]
-use tauri::TitleBarStyle;
 
 /// 生成当前平台的 User-Agent 字符串
 fn platform_user_agent() -> String {
@@ -89,6 +87,17 @@ const DBL_CLICK_SCRIPT: &str = r#"(function(){
 /// 最大标签数量限制
 const MAX_TABS: usize = 10;
 
+/// LRU 阈值：后台超过此数量的 tab 将触发 WebView 销毁
+const LRU_THRESHOLD: usize = 3;
+
+/// 激活 tab 时返回的状态，指示前端是否需要重建 WebView
+#[derive(Clone, serde::Serialize)]
+struct ActivateResult {
+    tab_id: i32,
+    needs_recreate: bool,
+    exists: bool,
+}
+
 #[derive(Clone, serde::Serialize)]
 struct UrlPayload {
     tab_id: i32,
@@ -101,11 +110,13 @@ struct LoadingPayload {
     loading: bool,
 }
 
-/// 存储所有子窗口的句柄
+/// 存储所有嵌入 webview 的句柄
 struct WebViewPool {
-    windows: HashMap<i32, tauri::WebviewWindow>,
+    webviews: HashMap<i32, tauri::Webview>,
     active_tab_id: Option<i32>,
-    /// 内容区域在窗口中的位置（CSS 逻辑像素），由前端 ResizeObserver 实时更新
+    /// LRU 顺序：最近使用的在末尾，最久未使用的在开头
+    lru_order: VecDeque<i32>,
+    /// 内容区域在窗口中的位置（viewport 相对坐标，CSS 逻辑像素）
     content_x: f64,
     content_y: f64,
     content_width: f64,
@@ -115,8 +126,9 @@ struct WebViewPool {
 impl WebViewPool {
     fn new() -> Self {
         WebViewPool {
-            windows: HashMap::with_capacity(MAX_TABS),
+            webviews: HashMap::with_capacity(MAX_TABS),
             active_tab_id: None,
+            lru_order: VecDeque::with_capacity(MAX_TABS),
             content_x: 0.0,
             content_y: 0.0,
             content_width: 1200.0,
@@ -124,29 +136,52 @@ impl WebViewPool {
         }
     }
 
-    fn insert(&mut self, tab_id: i32, window: tauri::WebviewWindow) {
-        self.windows.insert(tab_id, window);
+    fn insert(&mut self, tab_id: i32, webview: tauri::Webview) {
+        self.webviews.insert(tab_id, webview);
+        self.lru_order.push_back(tab_id);
     }
 
-    fn get(&self, tab_id: i32) -> Option<&tauri::WebviewWindow> {
-        self.windows.get(&tab_id)
-    }
-
-    fn remove(&mut self, tab_id: i32) -> Option<tauri::WebviewWindow> {
+    fn remove(&mut self, tab_id: i32) -> Option<tauri::Webview> {
         if self.active_tab_id == Some(tab_id) {
             self.active_tab_id = None;
         }
-        self.windows.remove(&tab_id)
+        self.lru_order.retain(|&id| id != tab_id);
+        self.webviews.remove(&tab_id)
     }
 
     fn len(&self) -> usize {
-        self.windows.len()
+        self.webviews.len()
     }
 
-    /// 从子窗口获取 WebView handle
-    fn get_webview(&self, tab_id: i32) -> Option<tauri::Webview> {
-        let label = format!("content-{}", tab_id);
-        self.windows.get(&tab_id).and_then(|w| w.get_webview(&label))
+    /// LRU 淘汰：当 webview 数超过阈值时，销毁最久未使用的
+    fn evict_lru(&mut self, _app: &AppHandle) {
+        while self.webviews.len() > LRU_THRESHOLD {
+            let evict_id = self.lru_order.iter().find(|&&id| {
+                self.active_tab_id != Some(id) && self.webviews.contains_key(&id)
+            }).copied();
+
+            match evict_id {
+                Some(id) => {
+                    debug_log!("[evict_lru] evicting tab_id={}", id);
+                    if let Some(webview) = self.webviews.remove(&id) {
+                        self.lru_order.retain(|&lid| lid != id);
+                        let _ = webview.close();
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// 记录 tab 被激活（移至 LRU 末尾）
+    fn touch_lru(&mut self, tab_id: i32) {
+        self.lru_order.retain(|&id| id != tab_id);
+        self.lru_order.push_back(tab_id);
+    }
+
+    /// 检查 tab 的嵌入 webview 是否存在
+    fn has_webview(&self, tab_id: i32) -> bool {
+        self.webviews.contains_key(&tab_id)
     }
 }
 
@@ -160,21 +195,16 @@ fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64,
     let height_script = format!("window.__mb_content_height = {};", height);
     let init_script = CTX_MENU_SCRIPT.to_owned() + &height_script + DBL_CLICK_SCRIPT;
 
-    // 使用 WebviewWindowBuilder 创建子窗口
-    // 子窗口无装饰、不可调整大小、无阴影，与主窗口 content 区域精确对齐
     let nav_handle = app.clone();
     let load_handle = app.clone();
     let nav_tab_id = tab_id;
     let load_tab_id = tab_id;
     let nav_app = app.clone();
 
-    let window = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(parsed_url))
+    let webview_builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
         .user_agent(&platform_user_agent())
         .initialization_script(&init_script)
         .incognito(true)
-        .decorations(false)
-        .resizable(false)
-        .shadow(false)
         .on_navigation(move |url| {
             debug_log!("[on_navigation] tab_id={} url={} ALLOW={}", nav_tab_id, url, true);
             let _ = nav_app.emit(
@@ -186,7 +216,7 @@ fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64,
             );
             true
         })
-        .on_page_load(move |_ww, payload| {
+        .on_page_load(move |_webview, payload| {
             let loading = matches!(payload.event(), PageLoadEvent::Started);
             let url_str = payload.url().to_string();
             debug_log!("[on_page_load] tab_id={} event={:?} loading={} url={}", load_tab_id, payload.event(), loading, url_str);
@@ -201,50 +231,74 @@ fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64,
                     UrlPayload { tab_id: load_tab_id, url: url_str },
                 );
             }
-        })
-        .build()
-        .map_err(|e| format!("创建子窗口失败: {}", e))?;
+        });
 
-    // 设置位置和大小
-    let _ = window.set_position(LogicalPosition::new(x, y));
-    let _ = window.set_size(LogicalSize::new(width, height));
+    // 获取主窗口（Window 句柄，add_child 方法所在类型）
+    let main_window = app.get_window("main").ok_or("主窗口未找到")?;
+    let webview = main_window
+        .add_child(
+            webview_builder,
+            LogicalPosition::new(x, y),
+            LogicalSize::new(width, height),
+        )
+        .map_err(|e| format!("嵌入 webview 失败: {}", e))?;
 
     // 存入全局状态
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     {
         let mut pool_guard = pool.lock().unwrap();
         if pool_guard.len() >= MAX_TABS {
-            let _ = window.close();
+            let _ = webview.close();
             return Err(format!("达到最大标签数量限制 ({})", MAX_TABS));
         }
-        pool_guard.insert(tab_id, window);
+        pool_guard.insert(tab_id, webview);
+        pool_guard.evict_lru(&app);
     }
     Ok(())
 }
 
 #[tauri::command]
-fn activate_tab(active_tab_id: i32, app: AppHandle) {
+fn activate_tab(active_tab_id: i32, app: AppHandle) -> ActivateResult {
     debug_log!("[activate_tab] active_tab_id={}", active_tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let mut pool_guard = pool.lock().unwrap();
 
     let prev_active = pool_guard.active_tab_id.replace(active_tab_id);
 
-    // 隐藏前一个活跃 tab 的子窗口
+    // 隐藏前一个活跃 tab 的嵌入 webview
     if let Some(prev_id) = prev_active {
         if prev_id != active_tab_id {
-            if let Some(w) = pool_guard.windows.get(&prev_id) {
-                let _ = w.hide();
+            if let Some(webview) = pool_guard.webviews.get(&prev_id) {
+                let _ = webview.hide();
             }
         }
     }
 
-    // 显示当前 tab 的子窗口
-    if let Some(w) = pool_guard.windows.get(&active_tab_id) {
-        let _ = w.set_position(LogicalPosition::new(pool_guard.content_x, pool_guard.content_y));
-        let _ = w.set_size(LogicalSize::new(pool_guard.content_width, pool_guard.content_height));
-        let _ = w.show();
-        let _ = w.set_focus();
+    // 检查目标 tab 的 webview 是否还存在
+    if !pool_guard.has_webview(active_tab_id) {
+        debug_log!("[activate_tab] tab_id={} webview not found, needs recreate", active_tab_id);
+        return ActivateResult {
+            tab_id: active_tab_id,
+            needs_recreate: true,
+            exists: false,
+        };
+    }
+
+    // 更新 LRU 顺序
+    pool_guard.touch_lru(active_tab_id);
+
+    // 直接使用 viewport 坐标设置嵌入 webview 的位置和尺寸
+    if let Some(webview) = pool_guard.webviews.get(&active_tab_id) {
+        let _ = webview.set_position(LogicalPosition::new(pool_guard.content_x, pool_guard.content_y));
+        let _ = webview.set_size(LogicalSize::new(pool_guard.content_width, pool_guard.content_height));
+        let _ = webview.show();
+        let _ = webview.set_focus();
+    }
+
+    ActivateResult {
+        tab_id: active_tab_id,
+        needs_recreate: false,
+        exists: true,
     }
 }
 
@@ -253,8 +307,8 @@ fn close_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[close_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let mut pool_guard = pool.lock().unwrap();
-    if let Some(window) = pool_guard.remove(tab_id) {
-        let _ = window.close();
+    if let Some(webview) = pool_guard.remove(tab_id) {
+        let _ = webview.close();
     }
 }
 
@@ -263,10 +317,10 @@ fn navigate_to_url(tab_id: i32, url: String, app: AppHandle) {
     debug_log!("[navigate_to_url] tab_id={} url={}", tab_id, url);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
-    if let Some(wv) = pool_guard.get_webview(tab_id) {
+    if let Some(webview) = pool_guard.webviews.get(&tab_id) {
         debug_log!("[navigate_to_url] found webview, navigating to: {}", url);
         if let Ok(parsed_url) = url::Url::parse(&url) {
-            let result = wv.navigate(parsed_url);
+            let result = webview.navigate(parsed_url);
             debug_log!("[navigate_to_url] navigate result: {:?}", result);
         } else {
             debug_log!("[navigate_to_url] invalid URL: {}", url);
@@ -281,8 +335,8 @@ fn reload_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[reload_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
-    if let Some(wv) = pool_guard.get_webview(tab_id) {
-        let _ = wv.eval("window.location.reload();");
+    if let Some(webview) = pool_guard.webviews.get(&tab_id) {
+        let _ = webview.eval("window.location.reload();");
     }
 }
 
@@ -291,8 +345,8 @@ fn go_back_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[go_back_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
-    if let Some(wv) = pool_guard.get_webview(tab_id) {
-        let _ = wv.eval("window.history.back();");
+    if let Some(webview) = pool_guard.webviews.get(&tab_id) {
+        let _ = webview.eval("window.history.back();");
     }
 }
 
@@ -301,8 +355,8 @@ fn go_forward_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[go_forward_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
-    if let Some(wv) = pool_guard.get_webview(tab_id) {
-        let _ = wv.eval("window.history.forward();");
+    if let Some(webview) = pool_guard.webviews.get(&tab_id) {
+        let _ = webview.eval("window.history.forward();");
     }
 }
 
@@ -311,43 +365,32 @@ fn open_devtools_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[open_devtools_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
-    if let Some(wv) = pool_guard.get_webview(tab_id) {
-        wv.open_devtools();
+    if let Some(webview) = pool_guard.webviews.get(&tab_id) {
+        webview.open_devtools();
     }
 }
 
 /// 前端 ResizeObserver 检测到内容区域尺寸变化时调用
-/// 同步更新所有子窗口的位置和尺寸
+/// 直接使用 viewport 坐标更新嵌入 webview 的位置和尺寸
 #[tauri::command]
 fn resize_content_area(x: f64, y: f64, width: f64, height: f64, app: AppHandle) {
     debug_log!("[resize_content_area] pos={}x{} size={}x{}", x, y, width, height);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let mut pool_guard = pool.lock().unwrap();
 
-    if height <= 0.0 || width <= 0.0 {
-        // 内容区域不可见（如窗口最小化），隐藏所有子窗口
-        debug_log!("[resize_content_area] content area hidden, hiding all webviews");
-        for (_, w) in &pool_guard.windows {
-            let _ = w.hide();
-        }
-        return;
-    }
-
-    // 更新存储的内容区域位置
     pool_guard.content_x = x;
     pool_guard.content_y = y;
     pool_guard.content_width = width;
     pool_guard.content_height = height;
 
     let active_id = pool_guard.active_tab_id;
-    for (&tab_id, window) in &pool_guard.windows {
-        let is_active = active_id == Some(tab_id);
-        if is_active {
-            let _ = window.set_position(LogicalPosition::new(x, y));
-            let _ = window.set_size(LogicalSize::new(width, height));
-            let _ = window.set_focus();
+    for (&tab_id, webview) in &pool_guard.webviews {
+        if active_id == Some(tab_id) {
+            let _ = webview.set_position(LogicalPosition::new(x, y));
+            let _ = webview.set_size(LogicalSize::new(width, height));
+            let _ = webview.set_focus();
         } else {
-            let _ = window.hide();
+            let _ = webview.hide();
         }
     }
 }
@@ -367,36 +410,16 @@ fn main() {
             resize_content_area,
         ])
         .setup(|app| {
-            debug_log!("[setup] initializing mini browser with child-window approach");
+            debug_log!("[setup] initializing mini browser with native decorations");
 
-            // 所有平台统一去除原生窗口装饰，由前端完全控制布局
-            if let Some(window) = app.get_window("main") {
-                let _ = window.set_decorations(false);
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = window.set_title_bar_style(TitleBarStyle::Overlay);
-                    debug_log!("[setup] macOS: decorations removed, titlebar overlay");
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    debug_log!("[setup] decorations removed for cross-platform consistency");
-                }
-            }
-
-            // 不再在 setup 阶段提前创建 tab，由前端 ResizeObserver 首次回调时创建
-
-            // 监听主窗口 resize / close 事件
-            let window = app.get_window("main").expect("main window not found");
+            let window = app.get_webview_window("main").expect("main window not found");
             let close_app = app.handle().clone();
             window.on_window_event(move |event| {
-                if let WindowEvent::Resized(physical) = event {
-                    debug_log!("[on_window_event::Resized] physical={}x{}", physical.width, physical.height);
-                }
                 if let WindowEvent::CloseRequested { .. } = event {
-                    debug_log!("[on_window_event::CloseRequested] cleaning up child windows");
+                    debug_log!("[on_window_event::CloseRequested] cleaning up child webviews");
                     let pool = close_app.state::<Arc<Mutex<WebViewPool>>>();
                     let pool_guard = pool.lock().unwrap();
-                    for (_, w) in &pool_guard.windows {
+                    for (_, w) in &pool_guard.webviews {
                         let _ = w.close();
                     }
                 }

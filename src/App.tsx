@@ -5,10 +5,8 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 
 const appWindow = getCurrentWindow();
 
-const TITLEBAR_HEIGHT = 28;
 const TABBAR_HEIGHT = 36;
 const TOOLBAR_HEIGHT = 44;
-const STATUSBAR_HEIGHT = 24;
 
 interface Tab {
     id: number;
@@ -16,7 +14,7 @@ interface Tab {
     url: string;
     history: string[];
     historyIndex: number;
-    addressInput: string; // 每个 tab 独立的地址栏输入
+    addressInput: string;
 }
 
 function newTabId(tabs: Tab[]): number {
@@ -34,7 +32,6 @@ export default function App() {
 
     const activeTab = tabs.find((t) => t.id === activeTabId);
 
-    // 使用 ref 持有最新状态，避免回调依赖重建
     const tabsRef = useRef(tabs);
     tabsRef.current = tabs;
     const activeTabIdRef = useRef(activeTabId);
@@ -78,18 +75,16 @@ export default function App() {
         return () => { unlisten.then((f) => f()); };
     }, []);
 
-    // 监听内容区域尺寸变化，实时同步到 Rust（替代硬编码 chrome 高度计算）
-    // 同时用于跨平台首次初始化：首次回调时创建初始 tab，确保坐标准确
+    // ResizeObserver: sync content area position to Rust
     useEffect(() => {
         const el = contentRef.current;
         if (!el) return;
 
         const sendContentSize = async () => {
             const rect = el.getBoundingClientRect();
-            const wp = await appWindow.innerPosition();
             invoke('resize_content_area', {
-                x: wp.x + rect.left,
-                y: wp.y + rect.top,
+                x: Math.round(rect.left),
+                y: Math.round(rect.top),
                 width: Math.round(rect.width),
                 height: Math.round(rect.height),
             }).catch(console.error);
@@ -99,36 +94,50 @@ export default function App() {
 
         const observer = new ResizeObserver(() => {
             sendContentSize().catch(console.error);
-            // 使用 ref 确保只创建一次，避免 ResizeObserver 多次触发的竞态
             if (initRef.current) return;
             initRef.current = true;
 
-            // 等待两帧确保布局完全稳定（跨平台兼容）
-            const scheduleCreate = () => {
-                requestAnimationFrame(() => {
-                    requestAnimationFrame(async () => {
-                        const id = newTabId([]);
-                        const r = contentRef.current?.getBoundingClientRect();
-                        const wp = await appWindow.innerPosition();
-                        invoke('create_tab', {
-                            tabId: id,
-                            url: 'about:blank',
-                            x: (r?.left ?? 0) + wp.x,
-                            y: (r?.top ?? 0) + wp.y,
-                            width: Math.round(r?.width ?? 1200),
-                            height: Math.round(r?.height ?? 800),
-                        }).then(() => {
-                            setTabs([defaultTab(id)]);
-                            setActiveTabId(id);
-                            return invoke('activate_tab', { activeTabId: id });
-                        }).catch(console.error);
-                    });
-                });
-            };
-            scheduleCreate();
+            // 首次创建初始 tab
+            requestAnimationFrame(async () => {
+                const id = newTabId([]);
+                const r = contentRef.current?.getBoundingClientRect();
+                invoke('create_tab', {
+                    tabId: id,
+                    url: 'about:blank',
+                    x: Math.round(r?.left ?? 0),
+                    y: Math.round(r?.top ?? 0),
+                    width: Math.round(r?.width ?? 1200),
+                    height: Math.round(r?.height ?? 800),
+                }).then(() => {
+                    setTabs([defaultTab(id)]);
+                    setActiveTabId(id);
+                    return invoke('activate_tab', { activeTabId: id });
+                }).catch(console.error);
+            });
         });
         observer.observe(el);
         return () => observer.disconnect();
+    }, []);
+
+    // 创建 tab 或重建被 LRU 淘汰的 WebView
+    const ensureWebview = useCallback(async (tabId: number): Promise<boolean> => {
+        const result = await invoke<{ tab_id: number; needs_recreate: boolean }>('activate_tab', { activeTabId: tabId });
+        if (result.needs_recreate) {
+            const tab = tabsRef.current.find((t) => t.id === tabId);
+            const el = contentRef.current;
+            const rect = el?.getBoundingClientRect();
+            await invoke('create_tab', {
+                tabId,
+                url: tab?.url ?? 'about:blank',
+                x: Math.round(rect?.left ?? 0),
+                y: Math.round(rect?.top ?? 0),
+                width: Math.round(rect?.width ?? 1200),
+                height: Math.round(rect?.height ?? 800),
+            });
+            await invoke('activate_tab', { activeTabId: tabId });
+            return true;
+        }
+        return false;
     }, []);
 
     const navigate = useCallback(async (url?: string) => {
@@ -186,27 +195,18 @@ export default function App() {
         try {
             const el = contentRef.current;
             const rect = el?.getBoundingClientRect();
-            const wp = await appWindow.innerPosition();
             await invoke('create_tab', {
                 tabId: id,
                 url: 'about:blank',
-                x: (rect?.left ?? 0) + wp.x,
-                y: (rect?.top ?? 0) + wp.y,
+                x: Math.round(rect?.left ?? 0),
+                y: Math.round(rect?.top ?? 0),
                 width: Math.round(rect?.width ?? 1200),
                 height: Math.round(rect?.height ?? 800),
             });
             setTabs((prev) => [...prev, defaultTab(id)]);
             setActiveTabId(id);
             setLoading(false);
-            // 等待一帧确保 React 状态更新 + 布局稳定
-            await new Promise<void>(resolve => {
-                requestAnimationFrame(resolve);
-            });
             await invoke('activate_tab', { activeTabId: id });
-            // 额外等待一帧确保 WebView 真正显示
-            await new Promise<void>(resolve => {
-                requestAnimationFrame(resolve);
-            });
         } catch (err) {
             console.error('[newTab] failed:', err);
             alert(`无法创建新标签：${err}`);
@@ -214,76 +214,28 @@ export default function App() {
     }, []);
 
     const closeTab = useCallback(async (id: number) => {
-        const tabs = tabsRef.current;
-        if (tabs.length <= 1) return;
-        const idx = tabs.findIndex((t) => t.id === id);
-        // 先关闭 WebView
+        const currentTabs = tabsRef.current;
+        if (currentTabs.length <= 1) return;
+        const idx = currentTabs.findIndex((t) => t.id === id);
         await invoke('close_tab', { tabId: id });
-        // 从 React 状态移除
         setTabs((prev) => prev.filter((t) => t.id !== id));
         if (id === activeTabIdRef.current) {
-            const next = idx > 0 ? tabs[idx - 1] : tabs[idx + 1];
+            const next = idx > 0 ? currentTabs[idx - 1] : currentTabs[idx + 1];
             if (next) {
                 setActiveTabId(next.id);
                 setLoading(next.url !== 'about:blank');
-                // 等待两帧确保布局完全稳定（跨平台兼容）
-                await new Promise<void>(resolve => {
-                    requestAnimationFrame(() => {
-                        requestAnimationFrame(resolve);
-                    });
-                });
-                const el = contentRef.current;
-                const rect = el?.getBoundingClientRect();
-                if (rect) {
-                    const wp = await appWindow.innerPosition();
-                    await invoke('resize_content_area', {
-                        x: wp.x + rect.left,
-                        y: wp.y + rect.top,
-                        width: Math.round(rect.width),
-                        height: Math.round(rect.height),
-                    });
-                }
-                // 激活 WebView（显示）
-                await invoke('activate_tab', { activeTabId: next.id });
-                // 额外等待一帧确保 WebView 真正显示
-                await new Promise<void>(resolve => {
-                    requestAnimationFrame(resolve);
-                });
+                await ensureWebview(next.id);
             }
         }
-    }, []);
+    }, [ensureWebview]);
 
-    const switchTab = useCallback(
-        async (id: number, url?: string) => {
-            setActiveTabId(id);
-            if (url !== undefined) {
-                setLoading(url !== 'about:blank');
-            }
-            // 等待两帧确保布局完全稳定（跨平台兼容：macOS WKWebView / Windows WebView2 / Linux WebKitGTK）
-            await new Promise<void>(resolve => {
-                requestAnimationFrame(() => {
-                    requestAnimationFrame(resolve);
-                });
-            });
-            const el = contentRef.current;
-            const rect = el?.getBoundingClientRect();
-            if (rect) {
-                const wp = await appWindow.innerPosition();
-                await invoke('resize_content_area', {
-                    x: wp.x + rect.left,
-                    y: wp.y + rect.top,
-                    width: Math.round(rect.width),
-                    height: Math.round(rect.height),
-                });
-            }
-            await invoke('activate_tab', { activeTabId: id });
-            // 额外等待一帧确保 WebView 真正显示（show() + set_position() + set_focus() 需要时间生效）
-            await new Promise<void>(resolve => {
-                requestAnimationFrame(resolve);
-            });
-        },
-        [],
-    );
+    const switchTab = useCallback(async (id: number, url?: string) => {
+        setActiveTabId(id);
+        if (url !== undefined) {
+            setLoading(url !== 'about:blank');
+        }
+        await ensureWebview(id);
+    }, [ensureWebview]);
 
     const handleAddressInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
         const id = activeTabIdRef.current;
@@ -308,48 +260,27 @@ export default function App() {
         const unlisten = appWindow.onResized(async () => {
             const minimized = await appWindow.isMinimized();
             if (!minimized && activeTabIdRef.current) {
-                // 窗口从最小化恢复，重新发送内容区域尺寸
                 const el = contentRef.current;
                 if (!el) return;
                 const rect = el.getBoundingClientRect();
-                const wp = await appWindow.innerPosition();
                 invoke('resize_content_area', {
-                    x: wp.x + rect.left,
-                    y: wp.y + rect.top,
+                    x: Math.round(rect.left),
+                    y: Math.round(rect.top),
                     width: Math.round(rect.width),
                     height: Math.round(rect.height),
                 }).catch(console.error);
+                // 恢复时确保 active tab 显示
+                const id = activeTabIdRef.current;
+                if (id) {
+                    invoke('activate_tab', { activeTabId: id }).catch(console.error);
+                }
             }
         });
         return () => { unlisten.then((f) => f()); };
     }, []);
 
-    const minimizeWindow = useCallback(async () => {
-        // 最小化前隐藏子窗口，防止它们独立显示在屏幕上
-        const el = contentRef.current;
-        if (el) {
-            const rect = el.getBoundingClientRect();
-            const wp = await appWindow.innerPosition();
-            await invoke('resize_content_area', {
-                x: wp.x + rect.left,
-                y: wp.y + rect.top,
-                width: 0,
-                height: 0,
-            }).catch(console.error);
-        }
-        await appWindow.minimize();
-    }, []);
-
-    const toggleMaximize = useCallback(() => {
-        appWindow.toggleMaximize().catch(console.error);
-    }, []);
-
     const handleAddressKeyDown = useCallback((e: React.KeyboardEvent) => {
         if (e.key === 'Enter') navigate();
-    }, []);
-
-    const closeWindow = useCallback(() => {
-        appWindow.close().catch(console.error);
     }, []);
 
     const btnStyle: React.CSSProperties = {
@@ -378,49 +309,6 @@ export default function App() {
                 userSelect: 'none',
             }}
         >
-            {/* 标题栏 */}
-            <div
-                style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    height: TITLEBAR_HEIGHT,
-                    background: '#1a1a2e',
-                    borderBottom: '1px solid #2d2d4a',
-                    flexShrink: 0,
-                }}
-            >
-                {/* 空白区域：用于窗口拖动 */}
-                <div
-                    data-tauri-drag-region
-                    style={{ flex: 1, height: '100%' }}
-                />
-                {/* 按钮区域：不设 data-tauri-drag-region，确保点击正常 */}
-                <div
-                    style={{
-                        display: 'flex',
-                        gap: 8,
-                        padding: '0 12px',
-                    }}
-                >
-                    <button onClick={minimizeWindow} style={btnStyle}>
-                        −
-                    </button>
-                    <button onClick={toggleMaximize} style={btnStyle}>
-                        □
-                    </button>
-                    <button
-                        onClick={closeWindow}
-                        style={{
-                            ...btnStyle,
-                            color: '#f87171',
-                            fontSize: 16,
-                        }}
-                    >
-                        ×
-                    </button>
-                </div>
-            </div>
-
             {/* 标签栏 */}
             <div
                 style={{
@@ -517,7 +405,7 @@ export default function App() {
                 </button>
             </div>
 
-            {/* 工具栏 */}
+            {/* 工具栏（内含地址栏进度条） */}
             <div
                 style={{
                     display: 'flex',
@@ -530,31 +418,10 @@ export default function App() {
                     height: TOOLBAR_HEIGHT,
                 }}
             >
-                <button
-                    onClick={goBack}
-                    disabled={!activeTab || activeTab.historyIndex <= 0}
-                    style={{
-                        ...navBtn,
-                        opacity: activeTab && activeTab.historyIndex > 0 ? 1 : 0.3,
-                    }}
-                >
+                <button onClick={goBack} style={{ ...navBtn, opacity: activeTab && activeTab.historyIndex > 0 ? 1 : 0.3 }}>
                     ←
                 </button>
-                <button
-                    onClick={goForward}
-                    disabled={
-                        !activeTab ||
-                        activeTab.historyIndex >= activeTab.history.length - 1
-                    }
-                    style={{
-                        ...navBtn,
-                        opacity:
-                            activeTab &&
-                            activeTab.historyIndex < activeTab.history.length - 1
-                                ? 1
-                                : 0.3,
-                    }}
-                >
+                <button onClick={goForward} style={{ ...navBtn, opacity: activeTab && activeTab.historyIndex < activeTab.history.length - 1 ? 1 : 0.3 }}>
                     →
                 </button>
                 <button onClick={reload} style={navBtn}>
@@ -575,6 +442,8 @@ export default function App() {
                         border: '1.5px solid #2d2d4a',
                         borderRadius: 8,
                         padding: '0 10px',
+                        position: 'relative',
+                        overflow: 'hidden',
                     }}
                 >
                     <span style={{ color: '#606080', fontSize: 13 }}>🔒</span>
@@ -630,25 +499,34 @@ export default function App() {
                             ×
                         </button>
                     )}
+                    {loading && (
+                        <div
+                            style={{
+                                position: 'absolute',
+                                bottom: 0,
+                                left: 0,
+                                height: 2,
+                                background: 'linear-gradient(90deg, #6366f1 0%, #818cf8 50%, #6366f1 100%)',
+                                backgroundSize: '200% 100%',
+                                width: '100%',
+                                animation: 'progress-slide 1.2s ease-in-out infinite',
+                            }}
+                        />
+                    )}
                 </div>
             </div>
 
-            {/* 进度条 */}
-            {loading && (
-                <div
-                    style={{
-                        height: 2,
-                        background: '#6366f1',
-                        flexShrink: 0,
-                    }}
-                />
-            )}
-
-            {/* 内容区域 — 用于测量坐标，子窗口会精确覆盖此区域 */}
+            {/* 内容区域 — 嵌入的 webview 会精确覆盖此区域 */}
             <div
                 ref={contentRef}
                 style={{
                     flex: 1,
+                    marginLeft: 10,
+                    marginRight: 10,
+                    marginTop: 50,
+                    marginBottom: 10,
+                    border: '1px solid #2d2d4a',
+                    borderRadius: 8,
                     background: '#0f0f1a',
                 }}
             >
@@ -669,29 +547,6 @@ export default function App() {
                             <p>输入网址开始浏览</p>
                         </div>
                     </div>
-                )}
-            </div>
-
-            {/* 状态栏 */}
-            <div
-                style={{
-                    height: STATUSBAR_HEIGHT,
-                    background: '#1a1a2e',
-                    borderTop: '1px solid #2d2d4a',
-                    display: 'flex',
-                    alignItems: 'center',
-                    padding: '0 12px',
-                    fontSize: 12,
-                    color: '#8080a0',
-                    flexShrink: 0,
-                }}
-            >
-                {loading ? (
-                    <span>⏳ 加载中...</span>
-                ) : activeTab && activeTab.url !== 'about:blank' ? (
-                    <span>✅ {activeTab.url}</span>
-                ) : (
-                    <span>🌐 准备浏览</span>
                 )}
             </div>
         </div>
