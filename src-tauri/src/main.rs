@@ -1,7 +1,10 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
+
+static NEXT_TAB_ID: AtomicI32 = AtomicI32::new(1000);
 use tauri::{
     webview::{PageLoadEvent, WebviewBuilder},
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WindowEvent,
@@ -84,6 +87,76 @@ const DBL_CLICK_SCRIPT: &str = r#"(function(){
     },true);
 })();"#;
 
+/// Linux 工具栏脚本：在主 webview 上覆盖浏览器控件
+/// 通过 on_page_load 注入，每次页面加载都会执行
+/// 注意：此脚本在注入时由插件回调包裹 inline 数据（__MB_INLINE_TABS, __MB_INLINE_ACTIVE）
+/// 不使用 IPC 调用（外部页面 IPC 不可用），改用 URL 导航模式
+const TOOLBAR_SCRIPT: &str = r#";(function(){
+    try{
+    if(document.getElementById('__mb_tb'))return;
+    var L=window.location.href;
+    if(L&&(L.startsWith('http://localhost')||L.startsWith('tauri://')||L.startsWith('https://tauri')))return;
+    // Intercept target=_blank links
+    document.addEventListener('click',function(e){var a=e.target.closest('a');if(a&&a.target==='_blank'){e.preventDefault();window.location.href=a.href}},true);
+    // Tab state from inline data (set by Rust plugin callback)
+    var tabs=window.__MB_INLINE_TABS||[];
+    var activeId=window.__MB_INLINE_ACTIVE||0;
+    window.__mb_active_tab_id=activeId;
+    function nav(u){if(!u)return;if(!u.match(/^https?:\/\//)){u=u.includes('.')?'https://'+u:'https://www.google.com/search?q='+encodeURIComponent(u)}window.location.href=u}
+    // Cleanup inline data
+    try{delete window.__MB_INLINE_TABS;delete window.__MB_INLINE_ACTIVE}catch(e){}
+    buildUI(tabs,activeId);
+    function buildUI(tabs,activeId){
+    var d=document.createElement('div');d.id='__mb_tb';d.style.cssText='position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#1a1a2e;border-bottom:1px solid #2d2d4a;font:13px system-ui,sans-serif;color:#e8e8f0;box-shadow:0 2px 8px rgba(0,0,0,0.4);';
+    // Tab bar
+    var tb=document.createElement('div');tb.style.cssText='display:flex;align-items:center;gap:2px;padding:2px 8px;border-bottom:1px solid #2d2d4a;';
+    tabs.forEach(function(t){
+        var t2=document.createElement('div');t2.style.cssText='display:flex;align-items:center;gap:4px;padding:4px 6px;border-radius:6px;cursor:pointer;min-width:60px;max-width:140px;height:26px;font-size:12px;flex-shrink:0;color:#e8e8f0;background:'+(t.id===activeId?'#2d2d52':'transparent')+';';
+        t2.onmouseenter=function(){this.style.background='#2d2d52'};
+        t2.onmouseleave=function(){this.style.background=t.id===activeId?'#2d2d52':'transparent'};
+        t2.onclick=function(){if(t.id!==activeId){window.location.href='about:blank?__mb_switch='+t.id}};
+        var sp=document.createElement('span');sp.style.cssText='overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;';sp.textContent=t.url&&t.url!=='about:blank'?t.url:'新标签页';
+        t2.appendChild(sp);
+        var cx=document.createElement('span');cx.textContent='×';cx.style.cssText='width:16px;height:16px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:12px;color:#606080;cursor:pointer;flex-shrink:0;';
+        cx.onmouseenter=function(){this.style.background='#3d3d62'};cx.onmouseleave=function(){this.style.background='transparent'};
+        cx.onclick=function(e){e.stopPropagation();window.location.href='about:blank?__mb_close='+t.id};
+        t2.appendChild(cx);tb.appendChild(t2);
+    });
+    var nt=document.createElement('button');nt.textContent='+';nt.style.cssText='width:24px;height:24px;border:none;background:transparent;color:#a0a0c0;border-radius:6px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-left:2px;';
+    nt.onmouseenter=function(){this.style.background='#2d2d52'};nt.onmouseleave=function(){this.style.background='transparent'};
+    nt.onclick=function(){window.location.href='about:blank?__mb_new='+Date.now()};
+    tb.appendChild(nt);d.appendChild(tb);
+    // Navigation bar
+    var nb=document.createElement('div');nb.style.cssText='display:flex;align-items:center;gap:4px;padding:6px 10px;';
+    function bt(t,f){var b=document.createElement('button');b.textContent=t;b.style.cssText='width:28px;height:28px;border:none;background:transparent;color:#a0a0c0;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;flex-shrink:0;';b.onmouseenter=function(){this.style.background='#2d2d52'};b.onmouseleave=function(){this.style.background='transparent'};b.onclick=f;return b;}
+    nb.appendChild(bt('←',function(){window.history.back()}));
+    nb.appendChild(bt('→',function(){window.history.forward()}));
+    nb.appendChild(bt('↻',function(){window.location.reload()}));
+    var u=document.createElement('input');u.style.cssText='flex:1;height:32px;border:1.5px solid #2d2d4a;border-radius:8px;background:#0f0f1a;color:#e8e8f0;padding:0 10px;font-size:13px;outline:none;min-width:0;';u.value=L.startsWith('about:blank')?'':L;
+    u.placeholder='输入网址或搜索...';
+    u.onfocus=function(){this.select()};
+    u.onkeydown=function(e){if(e.key==='Enter'){var v=u.value.trim();if(v)nav(v)}};
+    nb.appendChild(u);
+    var gb=document.createElement('button');gb.textContent='→';gb.style.cssText='width:28px;height:28px;border:none;background:#6366f1;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;flex-shrink:0;';
+    gb.onclick=function(){var v=u.value.trim();if(v)nav(v)};
+    nb.appendChild(gb);
+    nb.appendChild(bt('🔧',function(){window.location.href='about:blank?__mb_devtools='+activeId;}));
+    d.appendChild(nb);
+    // Welcome page for about:blank (including about:blank?__mb_new=... and __mb_close=...)
+    if(L.startsWith('about:blank')){
+        var w=document.createElement('div');w.id='__mb_welcome';w.style.cssText='display:flex;align-items:center;justify-content:center;height:calc(100vh - 80px);background:#0f0f1a;';
+        var wc=document.createElement('div');wc.style.cssText='text-align:center;color:#606080;';
+        wc.innerHTML='<div style="font-size:48px;opacity:0.4;margin-bottom:16px;">🌐</div><h2 style="font-size:18px;font-weight:600;margin-bottom:8px;color:#e8e8f0;">迷你浏览器</h2><p>输入网址开始浏览</p>';
+        w.appendChild(wc);d.appendChild(w);
+    }
+    document.body.prepend(d);
+    var p=function(){var e=document.getElementById('__mb_tb');if(e){var h=e.offsetHeight;document.body.style.paddingTop=Math.max(parseInt(document.body.style.paddingTop)||0,h)+'px'}};
+    setTimeout(p,50);
+    setInterval(function(){var a=u.value,b=window.location.href;if(a!==b&&b&&!b.startsWith('about:blank'))u.value=b},500);
+    } // buildUI end
+    }catch(e){}
+})();"#;
+
 /// 最大标签数量限制
 const MAX_TABS: usize = 10;
 
@@ -110,6 +183,18 @@ struct LoadingPayload {
     loading: bool,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct TabInfo {
+    id: i32,
+    url: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ToolbarState {
+    tabs: Vec<TabInfo>,
+    active_tab_id: i32,
+}
+
 /// 存储所有嵌入 webview 的句柄
 struct WebViewPool {
     webviews: HashMap<i32, tauri::Webview>,
@@ -121,6 +206,8 @@ struct WebViewPool {
     content_y: f64,
     content_width: f64,
     content_height: f64,
+    /// 标签页 URL 记录（tab_id -> url），Linux 上用于工具栏脚本
+    tab_urls: HashMap<i32, String>,
 }
 
 impl WebViewPool {
@@ -133,11 +220,19 @@ impl WebViewPool {
             content_y: 0.0,
             content_width: 1200.0,
             content_height: 800.0,
+            tab_urls: HashMap::with_capacity(MAX_TABS),
         }
     }
 
-    fn insert(&mut self, tab_id: i32, webview: tauri::Webview) {
+    fn insert(&mut self, tab_id: i32, url: &str, webview: tauri::Webview) {
         self.webviews.insert(tab_id, webview);
+        self.tab_urls.insert(tab_id, url.to_string());
+        self.lru_order.push_back(tab_id);
+    }
+
+    fn insert_tab_only(&mut self, tab_id: i32, url: &str) {
+        // Linux: store tab info without a webview
+        self.tab_urls.insert(tab_id, url.to_string());
         self.lru_order.push_back(tab_id);
     }
 
@@ -146,6 +241,7 @@ impl WebViewPool {
             self.active_tab_id = None;
         }
         self.lru_order.retain(|&id| id != tab_id);
+        self.tab_urls.remove(&tab_id);
         self.webviews.remove(&tab_id)
     }
 
@@ -187,8 +283,27 @@ impl WebViewPool {
 
 #[tauri::command]
 fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64, app: AppHandle) -> Result<(), String> {
-    debug_log!("[create_tab] tab_id={} url={} pos={}x{} size={}x{}", tab_id, url, x, y, width, height);
+    eprintln!("[diag] create_tab ENTER: tab_id={} url={} pos={}x{} size={}x{}", tab_id, url, x, y, width, height);
 
+    let pool = app.state::<Arc<Mutex<WebViewPool>>>();
+    let mut pool_guard = pool.lock().unwrap();
+    if pool_guard.len() >= MAX_TABS {
+        return Err(format!("达到最大标签数量限制 ({})", MAX_TABS));
+    }
+
+    if cfg!(target_os = "linux") {
+        // Linux: 不创建子 webview（避免 GTK 分离问题），只存储标签信息
+        pool_guard.insert_tab_only(tab_id, &url);
+        pool_guard.content_x = x;
+        pool_guard.content_y = y;
+        pool_guard.content_width = width;
+        pool_guard.content_height = height;
+        eprintln!("[diag] create_tab DONE (Linux, no add_child): pool has {} tabs, content={}x{} size={}x{}",
+            pool_guard.lru_order.len(), x, y, width, height);
+        return Ok(());
+    }
+
+    // macOS/Windows: 使用 add_child 创建嵌入 webview
     let label = format!("content-{}", tab_id);
     let parsed_url = url.parse::<url::Url>().map_err(|e| format!("URL 解析失败: {}", e))?;
 
@@ -233,7 +348,6 @@ fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64,
             }
         });
 
-    // 获取主窗口（Window 句柄，add_child 方法所在类型）
     let main_window = app.get_window("main").ok_or("主窗口未找到")?;
     let webview = main_window
         .add_child(
@@ -243,40 +357,60 @@ fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64,
         )
         .map_err(|e| format!("嵌入 webview 失败: {}", e))?;
 
-    // 存入全局状态
-    let pool = app.state::<Arc<Mutex<WebViewPool>>>();
-    {
-        let mut pool_guard = pool.lock().unwrap();
-        if pool_guard.len() >= MAX_TABS {
-            let _ = webview.close();
-            return Err(format!("达到最大标签数量限制 ({})", MAX_TABS));
-        }
-        pool_guard.insert(tab_id, webview);
-        pool_guard.evict_lru(&app);
+    if pool_guard.len() >= MAX_TABS {
+        let _ = webview.close();
+        return Err(format!("达到最大标签数量限制 ({})", MAX_TABS));
     }
+    pool_guard.insert(tab_id, &url, webview);
+    pool_guard.content_x = x;
+    pool_guard.content_y = y;
+    pool_guard.content_width = width;
+    pool_guard.content_height = height;
+    pool_guard.evict_lru(&app);
+    eprintln!("[diag] create_tab DONE: pool has {} webviews, content={}x{} size={}x{}",
+        pool_guard.len(), x, y, width, height);
     Ok(())
 }
 
 #[tauri::command]
 fn activate_tab(active_tab_id: i32, app: AppHandle) -> ActivateResult {
-    debug_log!("[activate_tab] active_tab_id={}", active_tab_id);
+    eprintln!("[diag] activate_tab ENTER: active_tab_id={}", active_tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let mut pool_guard = pool.lock().unwrap();
 
     let prev_active = pool_guard.active_tab_id.replace(active_tab_id);
+    eprintln!("[diag] activate_tab: prev_active={:?} webviews_count={}", prev_active, pool_guard.webviews.len());
 
-    // 隐藏前一个活跃 tab 的嵌入 webview
+    if cfg!(target_os = "linux") {
+        // Linux: 导航主 webview 到该 tab 的 URL
+        let url = pool_guard.tab_urls.get(&active_tab_id).cloned().unwrap_or_default();
+        drop(pool_guard);
+        if !url.is_empty() && url != "about:blank" {
+            eprintln!("[diag] activate_tab: Linux navigating main webview to url={}", url);
+            if let Some(wv) = app.get_webview_window("main") {
+                let escaped = url.replace('\'', "\\'");
+                let _ = wv.eval(&format!("window.location.href = '{}';", escaped));
+            }
+        }
+        return ActivateResult {
+            tab_id: active_tab_id,
+            needs_recreate: false,
+            exists: true,
+        };
+    }
+
+    // macOS/Windows: hide previous, show target
     if let Some(prev_id) = prev_active {
         if prev_id != active_tab_id {
             if let Some(webview) = pool_guard.webviews.get(&prev_id) {
+                eprintln!("[diag] activate_tab: hiding prev tab_id={}", prev_id);
                 let _ = webview.hide();
             }
         }
     }
 
-    // 检查目标 tab 的 webview 是否还存在
     if !pool_guard.has_webview(active_tab_id) {
-        debug_log!("[activate_tab] tab_id={} webview not found, needs recreate", active_tab_id);
+        eprintln!("[diag] activate_tab: webview NOT FOUND for tab_id={}, needs recreate", active_tab_id);
         return ActivateResult {
             tab_id: active_tab_id,
             needs_recreate: true,
@@ -284,15 +418,16 @@ fn activate_tab(active_tab_id: i32, app: AppHandle) -> ActivateResult {
         };
     }
 
-    // 更新 LRU 顺序
     pool_guard.touch_lru(active_tab_id);
 
-    // 直接使用 viewport 坐标设置嵌入 webview 的位置和尺寸
     if let Some(webview) = pool_guard.webviews.get(&active_tab_id) {
+        eprintln!("[diag] activate_tab: setting pos={}x{} size={}x{} then show/set_focus",
+            pool_guard.content_x, pool_guard.content_y, pool_guard.content_width, pool_guard.content_height);
         let _ = webview.set_position(LogicalPosition::new(pool_guard.content_x, pool_guard.content_y));
         let _ = webview.set_size(LogicalSize::new(pool_guard.content_width, pool_guard.content_height));
         let _ = webview.show();
         let _ = webview.set_focus();
+        eprintln!("[diag] activate_tab DONE: show+position done");
     }
 
     ActivateResult {
@@ -307,6 +442,11 @@ fn close_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[close_tab] tab_id={}", tab_id);
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let mut pool_guard = pool.lock().unwrap();
+    // Don't close the last tab
+    if pool_guard.tab_urls.len() <= 1 {
+        debug_log!("[close_tab] refusing to close last tab");
+        return;
+    }
     if let Some(webview) = pool_guard.remove(tab_id) {
         let _ = webview.close();
     }
@@ -314,25 +454,72 @@ fn close_tab(tab_id: i32, app: AppHandle) {
 
 #[tauri::command]
 fn navigate_to_url(tab_id: i32, url: String, app: AppHandle) {
-    debug_log!("[navigate_to_url] tab_id={} url={}", tab_id, url);
+    eprintln!("[diag] navigate_to_url ENTER: tab_id={} url={}", tab_id, url);
+
+    // 更新 tab URL 记录
+    {
+        let pool = app.state::<Arc<Mutex<WebViewPool>>>();
+        let mut pool_guard = pool.lock().unwrap();
+        pool_guard.tab_urls.insert(tab_id, url.clone());
+        // Linux: 确保 active_tab_id 同步更新，供工具栏 get_toolbar_state 使用
+        if cfg!(target_os = "linux") {
+            pool_guard.active_tab_id = Some(tab_id);
+            // 确保 tab 在 lru_order 中，供 get_toolbar_state 正确返回标签列表
+            if !pool_guard.lru_order.contains(&tab_id) {
+                pool_guard.lru_order.push_back(tab_id);
+            }
+        }
+    }
+
+    if cfg!(target_os = "linux") {
+        // Linux: 直接导航主 webview
+        eprintln!("[diag] navigate_to_url: Linux navigating main webview to: {}", url);
+        if let Some(wv) = app.get_webview_window("main") {
+            let escaped = url.replace('\'', "\\'");
+            let result = wv.eval(&format!("window.location.href = '{}';", escaped));
+            eprintln!("[diag] navigate_to_url: eval result={:?}", result);
+        } else {
+            eprintln!("[diag] navigate_to_url: ERROR main webview not found");
+        }
+        return;
+    }
+
+    // macOS/Windows: 导航子 webview
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
+    let has_wv = { pool.lock().unwrap().has_webview(tab_id) };
+
+    if !has_wv {
+        eprintln!("[diag] navigate_to_url: webview not found, recreating");
+        let (cx, cy, cw, ch) = {
+            let g = pool.lock().unwrap();
+            (g.content_x, g.content_y, g.content_width, g.content_height)
+        };
+        let _ = create_tab(tab_id, url.clone(), cx, cy, cw, ch, app.clone());
+    }
+
     let pool_guard = pool.lock().unwrap();
     if let Some(webview) = pool_guard.webviews.get(&tab_id) {
-        debug_log!("[navigate_to_url] found webview, navigating to: {}", url);
+        eprintln!("[diag] navigate_to_url: found webview, navigating to: {}", url);
         if let Ok(parsed_url) = url::Url::parse(&url) {
             let result = webview.navigate(parsed_url);
-            debug_log!("[navigate_to_url] navigate result: {:?}", result);
+            eprintln!("[diag] navigate_to_url: navigate result: {:?}", result);
         } else {
-            debug_log!("[navigate_to_url] invalid URL: {}", url);
+            eprintln!("[diag] navigate_to_url: invalid URL: {}", url);
         }
     } else {
-        debug_log!("[navigate_to_url] webview not found for tab_id={}", tab_id);
+        eprintln!("[diag] navigate_to_url: webview NOT FOUND after recreate attempt, tab_id={}", tab_id);
     }
 }
 
 #[tauri::command]
 fn reload_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[reload_tab] tab_id={}", tab_id);
+    if cfg!(target_os = "linux") {
+        if let Some(wv) = app.get_webview_window("main") {
+            let _ = wv.eval("window.location.reload();");
+        }
+        return;
+    }
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
     if let Some(webview) = pool_guard.webviews.get(&tab_id) {
@@ -343,6 +530,12 @@ fn reload_tab(tab_id: i32, app: AppHandle) {
 #[tauri::command]
 fn go_back_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[go_back_tab] tab_id={}", tab_id);
+    if cfg!(target_os = "linux") {
+        if let Some(wv) = app.get_webview_window("main") {
+            let _ = wv.eval("window.history.back();");
+        }
+        return;
+    }
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
     if let Some(webview) = pool_guard.webviews.get(&tab_id) {
@@ -353,6 +546,12 @@ fn go_back_tab(tab_id: i32, app: AppHandle) {
 #[tauri::command]
 fn go_forward_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[go_forward_tab] tab_id={}", tab_id);
+    if cfg!(target_os = "linux") {
+        if let Some(wv) = app.get_webview_window("main") {
+            let _ = wv.eval("window.history.forward();");
+        }
+        return;
+    }
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
     if let Some(webview) = pool_guard.webviews.get(&tab_id) {
@@ -363,6 +562,13 @@ fn go_forward_tab(tab_id: i32, app: AppHandle) {
 #[tauri::command]
 fn open_devtools_tab(tab_id: i32, app: AppHandle) {
     debug_log!("[open_devtools_tab] tab_id={}", tab_id);
+    if cfg!(target_os = "linux") {
+        // Linux: 在主 webview 上打开开发者工具
+        if let Some(wv) = app.get_webview_window("main") {
+            wv.open_devtools();
+        }
+        return;
+    }
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let pool_guard = pool.lock().unwrap();
     if let Some(webview) = pool_guard.webviews.get(&tab_id) {
@@ -370,26 +576,85 @@ fn open_devtools_tab(tab_id: i32, app: AppHandle) {
     }
 }
 
+/// Linux only: 获取当前工具栏状态（标签列表 + 活跃 tab ID）
+#[tauri::command]
+fn get_toolbar_state(app: AppHandle) -> ToolbarState {
+    let pool = app.state::<Arc<Mutex<WebViewPool>>>();
+    let pool_guard = pool.lock().unwrap();
+    let tabs: Vec<TabInfo> = if cfg!(target_os = "linux") {
+        pool_guard.lru_order.iter().filter_map(|&id| {
+            pool_guard.tab_urls.get(&id).map(|url| TabInfo {
+                id,
+                url: url.clone(),
+            })
+        }).collect()
+    } else {
+        pool_guard.webviews.iter().map(|(&id, _)| TabInfo {
+            id,
+            url: String::new(),
+        }).collect()
+    };
+    let active_id = pool_guard.active_tab_id.unwrap_or(0);
+    eprintln!("[diag] get_toolbar_state: {} tabs, active_id={}", tabs.len(), active_id);
+    if cfg!(target_os = "linux") {
+        for t in &tabs {
+            eprintln!("[diag] get_toolbar_state: tab id={} url={}", t.id, t.url);
+        }
+    }
+    ToolbarState {
+        active_tab_id: active_id,
+        tabs,
+    }
+}
+
 /// 前端 ResizeObserver 检测到内容区域尺寸变化时调用
 /// 直接使用 viewport 坐标更新嵌入 webview 的位置和尺寸
 #[tauri::command]
 fn resize_content_area(x: f64, y: f64, width: f64, height: f64, app: AppHandle) {
-    debug_log!("[resize_content_area] pos={}x{} size={}x{}", x, y, width, height);
+    eprintln!("[diag] resize_content_area ENTER: pos={}x{} size={}x{}", x, y, width, height);
+
+    // Linux: no child webviews (main webview is used directly)
+    if cfg!(target_os = "linux") {
+        eprintln!("[diag] resize_content_area: Linux no-op (no child webviews)");
+        return;
+    }
+
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
     let mut pool_guard = pool.lock().unwrap();
 
+    eprintln!("[diag] resize_content_area: active_tab_id={:?}", pool_guard.active_tab_id);
+
+    // 零/负尺寸为隐藏信号：隐藏活跃 webview 但不更新存储的 content 尺寸
+    if width <= 0.0 || height <= 0.0 {
+        if let Some(id) = pool_guard.active_tab_id {
+            if let Some(wv) = pool_guard.webviews.get(&id) {
+                eprintln!("[diag] resize_content_area HIDE: hide() path");
+                let _ = wv.hide();
+            }
+        } else {
+            eprintln!("[diag] resize_content_area HIDE: active_tab_id is None, NO WEBVIEW TO HIDE");
+        }
+        return;
+    }
+
+    eprintln!("[diag] resize_content_area SHOW: updating content={}x{} size={}x{}", x, y, width, height);
     pool_guard.content_x = x;
     pool_guard.content_y = y;
     pool_guard.content_width = width;
     pool_guard.content_height = height;
 
     let active_id = pool_guard.active_tab_id;
+
+    // 显示 active tab，隐藏 inactive tab
     for (&tab_id, webview) in &pool_guard.webviews {
         if active_id == Some(tab_id) {
+            eprintln!("[diag] resize_content_area SHOW: showing+pos active tab_id={}", tab_id);
+            let _ = webview.show();
             let _ = webview.set_position(LogicalPosition::new(x, y));
             let _ = webview.set_size(LogicalSize::new(width, height));
             let _ = webview.set_focus();
         } else {
+            eprintln!("[diag] resize_content_area SHOW: hiding inactive tab_id={}", tab_id);
             let _ = webview.hide();
         }
     }
@@ -408,7 +673,95 @@ fn main() {
             go_forward_tab,
             open_devtools_tab,
             resize_content_area,
+            get_toolbar_state,
         ])
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("toolbar")
+                .on_page_load(move |webview, payload| {
+                    eprintln!("[diag] toolbar: PLUGIN on_page_load event={:?} url={}", payload.event(), payload.url());
+                    if cfg!(target_os = "linux") && matches!(payload.event(), PageLoadEvent::Finished) {
+                        let url = payload.url().as_str();
+                        if !url.starts_with("http://localhost") && !url.starts_with("tauri://") {
+                            let app = webview.app_handle();
+                            let pool = app.state::<Arc<Mutex<WebViewPool>>>();
+                            let mut pool_guard = pool.lock().unwrap();
+
+                            // Handle URL-based tab commands using manual string scanning
+                            // (url crate query_pairs() doesn't work for about: scheme URLs)
+                            if url.starts_with("about:blank") {
+                                if let Some(_pos) = url.find("__mb_new=") {
+                                    // Use atomic counter for tab IDs (Date.now() values are too large for i32)
+                                    let new_id = NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed);
+                                    eprintln!("[diag] toolbar: URL_NEW tab id={}", new_id);
+                                    pool_guard.insert_tab_only(new_id, "about:blank");
+                                    pool_guard.active_tab_id = Some(new_id);
+                                }
+                                if let Some(pos) = url.find("__mb_close=") {
+                                    let s = &url[pos + "__mb_close=".len()..];
+                                    let v = s.split('&').next().unwrap_or(s);
+                                    if let Ok(close_id) = v.parse::<i32>() {
+                                        eprintln!("[diag] toolbar: URL_CLOSE tab id={}", close_id);
+                                        pool_guard.tab_urls.remove(&close_id);
+                                        pool_guard.lru_order.retain(|&id| id != close_id);
+                                        if pool_guard.active_tab_id == Some(close_id) {
+                                            pool_guard.active_tab_id = pool_guard.lru_order.back().copied();
+                                        }
+                                    }
+                                }
+                                if let Some(pos) = url.find("__mb_switch=") {
+                                    let s = &url[pos + "__mb_switch=".len()..];
+                                    let v = s.split('&').next().unwrap_or(s);
+                                    if let Ok(switch_id) = v.parse::<i32>() {
+                                        eprintln!("[diag] toolbar: URL_SWITCH tab id={}", switch_id);
+                                        pool_guard.active_tab_id = Some(switch_id);
+                                        let tab_url = pool_guard.tab_urls.get(&switch_id).cloned().unwrap_or_default();
+                                        if !tab_url.is_empty() && tab_url != "about:blank" {
+                                            drop(pool_guard);
+                                            let escaped = tab_url.replace('\'', "\\'");
+                                            let _ = webview.eval(&format!("window.location.href = '{}';", escaped));
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(pos) = url.find("__mb_devtools=") {
+                                    if let Ok(_devtools_id) = url[pos + "__mb_devtools=".len()..].split('&').next().unwrap_or_default().parse::<i32>() {
+                                        eprintln!("[diag] toolbar: URL_DEVTOOLS id={}", _devtools_id);
+                                        if let Some(wv) = webview.app_handle().get_webview_window("main") {
+                                            wv.open_devtools();
+                                        }
+                                        let _ = webview.eval("window.history.back()");
+                                        return;
+                                    }
+                                }
+                            } else {
+                                // Normal URL: update active tab's URL without matching
+                                if let Some(active_id) = pool_guard.active_tab_id {
+                                    pool_guard.tab_urls.insert(active_id, url.to_string());
+                                }
+                            }
+
+                            // Build inline tab state
+                            let tab_list: Vec<TabInfo> = pool_guard.lru_order.iter().filter_map(|&id| {
+                                pool_guard.tab_urls.get(&id).map(|u| TabInfo { id, url: u.clone() })
+                            }).collect();
+                            let tabs_json = serde_json::to_string(&tab_list).unwrap_or_default();
+                            let active_id = pool_guard.active_tab_id.unwrap_or(0);
+                            drop(pool_guard);
+
+                            eprintln!("[diag] toolbar: INJECTING tabs_json={} active_id={}", tabs_json, active_id);
+                            let script = format!(
+                                r#";(function(){{try{{window.__MB_INLINE_TABS={};window.__MB_INLINE_ACTIVE={};{}}}catch(e){{}}}})();"#,
+                                tabs_json, active_id, TOOLBAR_SCRIPT
+                            );
+                            let r = webview.eval(&script);
+                            eprintln!("[diag] toolbar: inject result={:?}", r);
+                        } else {
+                            eprintln!("[diag] toolbar: SKIP (app url) url={}", url);
+                        }
+                    }
+                })
+                .build()
+        )
         .setup(|app| {
             debug_log!("[setup] initializing mini browser with native decorations");
 

@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
 const appWindow = getCurrentWindow();
+const isLinux = navigator.userAgent.includes('Linux');
 
 const TABBAR_HEIGHT = 36;
 const TOOLBAR_HEIGHT = 44;
@@ -81,7 +82,16 @@ export default function App() {
         if (!el) return;
 
         const sendContentSize = async () => {
+            // Linux: 没有子 webview，无需发送 resize
+            if (isLinux) return;
+            const activeTab = tabsRef.current.find((t) => t.id === activeTabIdRef.current);
+            // about:blank 时不发送 resize（欢迎页和 webview 互斥）
+            if (activeTab && activeTab.url === 'about:blank') {
+                console.log('[diag] sendContentSize: about:blank, skip');
+                return;
+            }
             const rect = el.getBoundingClientRect();
+            console.log('[diag] sendContentSize: sending resize', { x: rect.left, y: rect.top, w: rect.width, h: rect.height });
             invoke('resize_content_area', {
                 x: Math.round(rect.left),
                 y: Math.round(rect.top),
@@ -97,22 +107,13 @@ export default function App() {
             if (initRef.current) return;
             initRef.current = true;
 
-            // 首次创建初始 tab
-            requestAnimationFrame(async () => {
+            // 首次创建初始 tab — 不创建 webview，仅设置 React 状态
+            // webview 在用户首次导航到真实 URL 时由 ensureWebview 创建
+            requestAnimationFrame(() => {
                 const id = newTabId([]);
-                const r = contentRef.current?.getBoundingClientRect();
-                invoke('create_tab', {
-                    tabId: id,
-                    url: 'about:blank',
-                    x: Math.round(r?.left ?? 0),
-                    y: Math.round(r?.top ?? 0),
-                    width: Math.round(r?.width ?? 1200),
-                    height: Math.round(r?.height ?? 800),
-                }).then(() => {
-                    setTabs([defaultTab(id)]);
-                    setActiveTabId(id);
-                    return invoke('activate_tab', { activeTabId: id });
-                }).catch(console.error);
+                console.log('[diag] init: setting state for tab', { id });
+                setTabs([defaultTab(id)]);
+                setActiveTabId(id);
             });
         });
         observer.observe(el);
@@ -120,10 +121,17 @@ export default function App() {
     }, []);
 
     // 创建 tab 或重建被 LRU 淘汰的 WebView
+    // about:blank 时不创建 webview（欢迎页和 webview 互斥）
     const ensureWebview = useCallback(async (tabId: number): Promise<boolean> => {
+        // Linux 没有子 webview，所有页面在主 webview 中加载
+        if (isLinux) return false;
+        const tab = tabsRef.current.find((t) => t.id === tabId);
+        if (tab && tab.url === 'about:blank') {
+            console.log('[diag] ensureWebview: about:blank, skip webview creation');
+            return false;
+        }
         const result = await invoke<{ tab_id: number; needs_recreate: boolean }>('activate_tab', { activeTabId: tabId });
         if (result.needs_recreate) {
-            const tab = tabsRef.current.find((t) => t.id === tabId);
             const el = contentRef.current;
             const rect = el?.getBoundingClientRect();
             await invoke('create_tab', {
@@ -158,6 +166,10 @@ export default function App() {
             ),
         );
         setLoading(true);
+        // Linux: 主 webview 直接导航，无需 ensureWebview
+        if (!isLinux) {
+            await ensureWebview(activeTabIdRef.current);
+        }
         await invoke('navigate_to_url', { tabId: activeTabIdRef.current, url: target });
     }, []);
 
@@ -192,25 +204,10 @@ export default function App() {
 
     const newTab = useCallback(async () => {
         const id = newTabId(tabsRef.current);
-        try {
-            const el = contentRef.current;
-            const rect = el?.getBoundingClientRect();
-            await invoke('create_tab', {
-                tabId: id,
-                url: 'about:blank',
-                x: Math.round(rect?.left ?? 0),
-                y: Math.round(rect?.top ?? 0),
-                width: Math.round(rect?.width ?? 1200),
-                height: Math.round(rect?.height ?? 800),
-            });
-            setTabs((prev) => [...prev, defaultTab(id)]);
-            setActiveTabId(id);
-            setLoading(false);
-            await invoke('activate_tab', { activeTabId: id });
-        } catch (err) {
-            console.error('[newTab] failed:', err);
-            alert(`无法创建新标签：${err}`);
-        }
+        // about:blank 时不创建 webview（欢迎页和 webview 互斥）
+        setTabs((prev) => [...prev, defaultTab(id)]);
+        setActiveTabId(id);
+        setLoading(false);
     }, []);
 
     const closeTab = useCallback(async (id: number) => {
@@ -224,7 +221,15 @@ export default function App() {
             if (next) {
                 setActiveTabId(next.id);
                 setLoading(next.url !== 'about:blank');
-                await ensureWebview(next.id);
+                if (isLinux) {
+                    if (next.url !== 'about:blank') {
+                        await invoke('navigate_to_url', { tabId: next.id, url: next.url });
+                    } else if (window.location.href !== 'about:blank') {
+                        window.location.href = 'about:blank';
+                    }
+                } else {
+                    await ensureWebview(next.id);
+                }
             }
         }
     }, [ensureWebview]);
@@ -234,7 +239,13 @@ export default function App() {
         if (url !== undefined) {
             setLoading(url !== 'about:blank');
         }
-        await ensureWebview(id);
+        if (isLinux) {
+            if (url && url !== 'about:blank') {
+                await invoke('navigate_to_url', { tabId: id, url });
+            }
+        } else {
+            await ensureWebview(id);
+        }
     }, [ensureWebview]);
 
     const handleAddressInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -257,9 +268,13 @@ export default function App() {
 
     // 监听主窗口尺寸变化，检测从最小化恢复
     useEffect(() => {
+        if (isLinux) return; // Linux 无需处理子 webview 恢复
         const unlisten = appWindow.onResized(async () => {
             const minimized = await appWindow.isMinimized();
             if (!minimized && activeTabIdRef.current) {
+                // about:blank 时不恢复 webview（欢迎页和 webview 互斥）
+                const tab = tabsRef.current.find((t) => t.id === activeTabIdRef.current);
+                if (tab && tab.url === 'about:blank') return;
                 const el = contentRef.current;
                 if (!el) return;
                 const rect = el.getBoundingClientRect();
@@ -278,6 +293,42 @@ export default function App() {
         });
         return () => { unlisten.then((f) => f()); };
     }, []);
+
+    // URL 变化时：about:blank → 隐藏 webview；真实 URL → 恢复 webview 显示
+    useEffect(() => {
+        if (!activeTab) {
+            console.log('[diag] urlEffect: activeTab is undefined');
+            return;
+        }
+        // Linux: 没有子 webview，无需 resize/ensureWebview
+        if (isLinux) return;
+        const el = contentRef.current;
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const tabId = activeTab.id;
+        console.log('[diag] urlEffect: url=' + activeTab.url + ' rect=' + JSON.stringify({ x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) }));
+        if (activeTab.url === 'about:blank') {
+            console.log('[diag] urlEffect: sending resize(0,0) for about:blank');
+            invoke('resize_content_area', {
+                x: Math.round(rect.left),
+                y: Math.round(rect.top),
+                width: 0,
+                height: 0,
+            }).catch(console.error);
+        } else {
+            console.log('[diag] urlEffect: ensuring webview + sending full resize for real URL');
+            ensureWebview(tabId).then(() => {
+                const r = contentRef.current?.getBoundingClientRect();
+                const rx = Math.round(r?.left ?? rect.left);
+                const ry = Math.round(r?.top ?? rect.top);
+                const rw = Math.round(r?.width ?? rect.width);
+                const rh = Math.round(r?.height ?? rect.height);
+                return invoke('resize_content_area', {
+                    x: rx, y: ry, width: rw, height: rh,
+                });
+            }).catch(console.error);
+        }
+    }, [activeTab?.url, ensureWebview]);
 
     const handleAddressKeyDown = useCallback((e: React.KeyboardEvent) => {
         if (e.key === 'Enter') navigate();
@@ -416,6 +467,7 @@ export default function App() {
                     borderBottom: '1px solid #2d2d4a',
                     flexShrink: 0,
                     height: TOOLBAR_HEIGHT,
+                    marginBottom: 20,
                 }}
             >
                 <button onClick={goBack} style={{ ...navBtn, opacity: activeTab && activeTab.historyIndex > 0 ? 1 : 0.3 }}>
@@ -521,13 +573,13 @@ export default function App() {
                 ref={contentRef}
                 style={{
                     flex: 1,
+                    marginTop: 10,
                     marginLeft: 10,
                     marginRight: 10,
-                    marginTop: 50,
                     marginBottom: 10,
-                    border: '1px solid #2d2d4a',
-                    borderRadius: 8,
-                    background: '#0f0f1a',
+                    border: activeTab?.url === 'about:blank' ? '1px solid #2d2d4a' : 'none',
+                    borderRadius: activeTab?.url === 'about:blank' ? 8 : 0,
+                    background: activeTab?.url === 'about:blank' ? '#0f0f1a' : 'transparent',
                 }}
             >
                 {(!activeTab || activeTab.url === 'about:blank') && !loading && (
