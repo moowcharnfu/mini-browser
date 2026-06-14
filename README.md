@@ -77,16 +77,30 @@ npm run test           # 全部测试
 
 ## 架构
 
-Mini Browser 使用**嵌入 webview 方案**：
+Mini Browser 使用**双架构方案**，根据平台自适应：
 
-- 每个标签页是嵌入主窗口的 `tauri::Webview`（通过 `Window::add_child()` 创建）
-- 与 React UI 在同一 OS 窗口内，不是独立子窗口
+### macOS / Windows：嵌入 WebView 方案
+
+每个标签页是嵌入主窗口的 `tauri::Webview`（通过 `Window::add_child()` 创建）：
+
+- 所有标签页与 React UI 在同一 OS 窗口内
 - 坐标直接使用 viewport 坐标（`getBoundingClientRect()`），无需屏幕坐标转换
 - 内容 div 使用 CSS `margin` + `border` + `border-radius` 实现留白效果
-- LRU 淘汰：最多保留 3 个后台 webview，超限销毁最久未使用的
 - 标签切换时 `webview.hide()`/`webview.show()` + 重设位置
+- LRU 淘汰：最多保留 3 个后台 webview，超限销毁最久未使用的
 
-技术栈：React + TypeScript + Vite（前端），Tauri v2 + Rust（后端），系统原生 WebView（WebKit / WebView2）
+### Linux (Ubuntu/WebKitGTK)：工具栏注入方案
+
+Linux 上 GTK 子 webview 有兼容性问题 + `__TAURI_INTERNALS__.invoke()` 在外部页面不可用，使用完全不同的架构：
+
+- **不创建子 webview**，只有一个主 webview 直接显示页面
+- 工具栏通过 `tauri::plugin::Builder::on_page_load` 回调在每次页面加载时注入
+- 所有 tab 操作通过 URL 参数传递（不用 IPC）：`about:blank?__mb_new/__mb_close/__mb_switch/__mb_devtools=ID`
+- Rust 侧维护 `WebViewPool`（`tab_urls: HashMap` + `lru_order: VecDeque`），每次注入时序列化为 JS 内联数据
+- Tab ID 使用 Rust 原子计数器（起始 1000，避免与 React IPC ID 冲突）
+- React 前端在 Linux 上跳过子 webview 相关逻辑
+
+技术栈：React + TypeScript + Vite（前端），Tauri v2 + Rust（后端），系统原生 WebView（WebKit / WebView2 / WebKitGTK）
 
 ### 图标
 
