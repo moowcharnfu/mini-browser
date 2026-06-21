@@ -30,6 +30,9 @@ export default function App() {
     const [tabs, setTabs] = useState<Tab[]>([]);
     const [activeTabId, setActiveTabId] = useState(0);
     const [loading, setLoading] = useState(false);
+    const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
+    const [settings, setSettings] = useState({ auto_clear_on_exit: false });
+    const [clearFeedback, setClearFeedback] = useState('');
 
     const activeTab = tabs.find((t) => t.id === activeTabId);
 
@@ -84,12 +87,6 @@ export default function App() {
         const sendContentSize = async () => {
             // Linux: 没有子 webview，无需发送 resize
             if (isLinux) return;
-            const activeTab = tabsRef.current.find((t) => t.id === activeTabIdRef.current);
-            // about:blank 时不发送 resize（欢迎页和 webview 互斥）
-            if (activeTab && activeTab.url === 'about:blank') {
-                console.log('[diag] sendContentSize: about:blank, skip');
-                return;
-            }
             const rect = el.getBoundingClientRect();
             console.log('[diag] sendContentSize: sending resize', { x: rect.left, y: rect.top, w: rect.width, h: rect.height });
             invoke('resize_content_area', {
@@ -202,13 +199,35 @@ export default function App() {
         }
     }, []);
 
-    const newTab = useCallback(async () => {
+    const newTab = useCallback(async (url?: string) => {
         const id = newTabId(tabsRef.current);
-        // about:blank 时不创建 webview（欢迎页和 webview 互斥）
-        setTabs((prev) => [...prev, defaultTab(id)]);
-        setActiveTabId(id);
-        setLoading(false);
-    }, []);
+        if (url && url !== 'about:blank') {
+            // 弹出窗口/新标签页：直接创建带 URL 的 tab
+            setTabs((prev) => [...prev, { ...defaultTab(id), url, addressInput: url, title: url }]);
+            setActiveTabId(id);
+            setLoading(true);
+            // 确保 webview 已创建再导航（非 Linux）
+            if (!isLinux) {
+                await ensureWebview(id);
+            }
+            await invoke('navigate_to_url', { tabId: id, url });
+        } else {
+            // about:blank 时不创建 webview（欢迎页和 webview 互斥）
+            setTabs((prev) => [...prev, defaultTab(id)]);
+            setActiveTabId(id);
+            setLoading(false);
+        }
+    }, [ensureWebview]);
+
+    // Listen for popup requests from content webviews (window.open / target=_blank)
+    useEffect(() => {
+        const unlisten = listen<{ url: string }>('popup://request', (e) => {
+            const { url } = e.payload;
+            console.log('[diag] popup://request received url=' + url);
+            newTab(url);
+        });
+        return () => { unlisten.then((f) => f()); };
+    }, [newTab]);
 
     const closeTab = useCallback(async (id: number) => {
         const currentTabs = tabsRef.current;
@@ -259,6 +278,46 @@ export default function App() {
         invoke('open_devtools_tab', { tabId: activeTabIdRef.current });
     }, []);
 
+    // 设置面板：加载当前设置 + Escape 关闭
+    useEffect(() => {
+        invoke<{ auto_clear_on_exit: boolean }>('get_settings').then((s) => {
+            setSettings(s);
+        }).catch(console.error);
+        const handleEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') setSettingsPanelOpen(false); };
+        window.addEventListener('keydown', handleEsc);
+        return () => window.removeEventListener('keydown', handleEsc);
+    }, []);
+
+    // 设置面板打开/关闭时强制更新 webview 位置（避免 webview 覆盖工具栏）
+    useEffect(() => {
+        if (isLinux) return;
+        const el = contentRef.current;
+        if (!el) return;
+        requestAnimationFrame(() => {
+            const rect = el.getBoundingClientRect();
+            invoke('resize_content_area', {
+                x: Math.round(rect.left),
+                y: Math.round(rect.top),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+            }).catch(console.error);
+        });
+    }, [settingsPanelOpen]);
+
+    // 切换退出自动清除
+    const toggleAutoClear = useCallback(async () => {
+        const next = { ...settings, auto_clear_on_exit: !settings.auto_clear_on_exit };
+        setSettings(next);
+        await invoke('set_settings', { settings: next });
+    }, [settings]);
+
+    // 清除缓存
+    const handleClearCache = useCallback(async () => {
+        await invoke('clear_browsing_data');
+        setClearFeedback('缓存已清除');
+        setTimeout(() => setClearFeedback(''), 2000);
+    }, []);
+
     const clearAddress = useCallback(() => {
         const id = activeTabIdRef.current;
         setTabs((prev) =>
@@ -272,9 +331,6 @@ export default function App() {
         const unlisten = appWindow.onResized(async () => {
             const minimized = await appWindow.isMinimized();
             if (!minimized && activeTabIdRef.current) {
-                // about:blank 时不恢复 webview（欢迎页和 webview 互斥）
-                const tab = tabsRef.current.find((t) => t.id === activeTabIdRef.current);
-                if (tab && tab.url === 'about:blank') return;
                 const el = contentRef.current;
                 if (!el) return;
                 const rect = el.getBoundingClientRect();
@@ -294,7 +350,7 @@ export default function App() {
         return () => { unlisten.then((f) => f()); };
     }, []);
 
-    // URL 变化时：about:blank → 隐藏 webview；真实 URL → 恢复 webview 显示
+    // URL 变化时：保持 webview 始终可见（不隐藏），确保尺寸和位置正确
     useEffect(() => {
         if (!activeTab) {
             console.log('[diag] urlEffect: activeTab is undefined');
@@ -308,12 +364,13 @@ export default function App() {
         const tabId = activeTab.id;
         console.log('[diag] urlEffect: url=' + activeTab.url + ' rect=' + JSON.stringify({ x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) }));
         if (activeTab.url === 'about:blank') {
-            console.log('[diag] urlEffect: sending resize(0,0) for about:blank');
+            // about:blank 时不隐藏 webview，直接 resize 保持可见
+            console.log('[diag] urlEffect: about:blank, keeping webview visible');
             invoke('resize_content_area', {
                 x: Math.round(rect.left),
                 y: Math.round(rect.top),
-                width: 0,
-                height: 0,
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
             }).catch(console.error);
         } else {
             console.log('[diag] urlEffect: ensuring webview + sending full resize for real URL');
@@ -435,7 +492,7 @@ export default function App() {
                     ))}
                 </div>
                 <button
-                    onClick={newTab}
+                    onClick={() => newTab()}
                     style={{
                         width: 26,
                         height: 26,
@@ -467,7 +524,6 @@ export default function App() {
                     borderBottom: '1px solid #2d2d4a',
                     flexShrink: 0,
                     height: TOOLBAR_HEIGHT,
-                    marginBottom: 20,
                 }}
             >
                 <button onClick={goBack} style={{ ...navBtn, opacity: activeTab && activeTab.historyIndex > 0 ? 1 : 0.3 }}>
@@ -479,8 +535,11 @@ export default function App() {
                 <button onClick={reload} style={navBtn}>
                     ↻
                 </button>
-                <button onClick={openDevtools} style={navBtn}>
+                <button onClick={() => setSettingsPanelOpen((v) => !v)} style={{ ...navBtn, background: settingsPanelOpen ? '#2d2d52' : 'transparent' }}>
                     🔧
+                </button>
+                <button onClick={openDevtools} style={navBtn}>
+                    🐞
                 </button>
 
                 <div
@@ -514,7 +573,7 @@ export default function App() {
                         }}
                     />
                     <button
-                        onClick={navigate}
+                        onClick={() => navigate()}
                         style={{
                             width: 28,
                             height: 28,
@@ -568,15 +627,39 @@ export default function App() {
                 </div>
             </div>
 
+            {/* 设置面板 — 内联在工具栏和内容之间，高于内容区域且不会被 webview 遮挡 */}
+            {settingsPanelOpen && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 14,
+                  padding: '5px 12px',
+                  background: '#1a1a2e',
+                  borderBottom: '1px solid #2d2d4a',
+                  flexShrink: 0,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 11, color: '#e8e8f0' }}>退出清除</span>
+                  <div onClick={toggleAutoClear} style={{ width: 32, height: 18, borderRadius: 9, cursor: 'pointer', background: settings.auto_clear_on_exit ? '#6366f1' : '#2d2d4a', position: 'relative', flexShrink: 0 }}>
+                    <div style={{ width: 14, height: 14, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: settings.auto_clear_on_exit ? 16 : 2, transition: 'left 0.15s' }} />
+                  </div>
+                </div>
+                <button onClick={handleClearCache} style={{ padding: '4px 10px', border: 'none', borderRadius: 5, background: '#6366f1', color: '#fff', fontSize: 11, cursor: 'pointer' }}>
+                  {clearFeedback || '清除缓存'}
+                </button>
+              </div>
+            )}
+
             {/* 内容区域 — 嵌入的 webview 会精确覆盖此区域 */}
             <div
                 ref={contentRef}
                 style={{
                     flex: 1,
-                    marginTop: 10,
+                    marginTop: 30,
                     marginLeft: 10,
                     marginRight: 10,
-                    marginBottom: 10,
                     border: activeTab?.url === 'about:blank' ? '1px solid #2d2d4a' : 'none',
                     borderRadius: activeTab?.url === 'about:blank' ? 8 : 0,
                     background: activeTab?.url === 'about:blank' ? '#0f0f1a' : 'transparent',

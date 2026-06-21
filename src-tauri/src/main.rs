@@ -1,30 +1,16 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 static NEXT_TAB_ID: AtomicI32 = AtomicI32::new(1000);
 use tauri::{
-    webview::{PageLoadEvent, WebviewBuilder},
+    webview::{NewWindowResponse, PageLoadEvent, WebviewBuilder},
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WindowEvent,
 };
 
 /// 生成当前平台的 User-Agent 字符串
-fn platform_user_agent() -> String {
-    let platform = if cfg!(target_os = "macos") {
-        "Macintosh; Intel Mac OS X 10_15_7"
-    } else if cfg!(target_os = "windows") {
-        "Windows NT 10.0; Win64; x64"
-    } else {
-        "X11; Linux x86_64"
-    };
-    format!(
-        "Mozilla/5.0 ({}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        platform
-    )
-}
-
 /// 调试日志：仅在 debug 构建中输出
 macro_rules! debug_log {
     ($($arg:tt)*) => {
@@ -72,19 +58,46 @@ const CTX_MENU_SCRIPT: &str = r#"(function(){
     document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.getElementById('__mb_menu');if(m)m.remove()}});
 })();"#;
 
-/// 双击打开链接脚本
-const DBL_CLICK_SCRIPT: &str = r#"(function(){
+/// 双击打开链接脚本：单击阻止导航（target=_blank 不阻止），双击触发跳转
+const DBCLICK_SCRIPT: &str = r#"(function(){
+    if(window.__mb_dbl)return;window.__mb_dbl=true;
+    var _pend=null,_tmr=null;
     document.addEventListener('click',function(e){
         var a=e.target.closest('a');
-        if(!a||!a.href)return;
-        if(e.button!==0)return;
-        var h=a.getAttribute('href')||'';
-        if(h.startsWith('javascript:')||h==='#'||h.startsWith('#'))return;
-        if(e.detail!==2){
-            e.preventDefault();
-            e.stopPropagation();
-        }
+        if(!a||!a.href||a.href.startsWith('about:'))return;
+        if(a.target==='_blank')return;
+        e.preventDefault();e.stopPropagation();
+        if(_pend===a){clearTimeout(_tmr);_pend=null;_tmr=null;window.location.href=a.href}
+        else{_pend=a;_tmr=setTimeout(function(){_pend=null;_tmr=null},300)}
     },true);
+})();"#;
+
+/// Popup 处理脚本：仅主 frame 使用，直接 IPC + 接收 iframe 的 postMessage
+/// 也接收 iframe 通过 postMessage 中继的 popup 请求
+const POPUP_SCRIPT: &str = r#"(function(){
+    if(window.__mb_popup)return;window.__mb_popup=true;
+    if(!window.__TAURI_INTERNALS__)return;
+    function ipc(m,a){try{window.__TAURI_INTERNALS__.invoke(m,a).catch(function(){})}catch(e){}}
+    var ow=window.open;
+    window.open=function(u){if(u&&typeof u==='string'){ipc('request_popup',{url:u});return{closed:false,close:function(){}}};return ow.apply(this,arguments)};
+    document.addEventListener('click',function(e){
+        var a=e.target.closest('a');if(a&&a.target==='_blank'&&a.href&&!a.href.startsWith('about:')){e.preventDefault();e.stopPropagation();ipc('request_popup',{url:a.href})}
+    },true);
+    window.addEventListener('message',function(e){
+        var d=e.data||{};
+        // popup relay from iframe
+        if(d.type==='__mb_popup'&&d.url&&window.__TAURI_INTERNALS__){ipc('request_popup',{url:d.url})}
+    });
+})();"#;
+
+/// 注入所有 frame 的轻量脚本：iframe 内的 target=_blank / window.open → postMessage 到父 frame
+const POPUP_IFRAME_SCRIPT: &str = r#"(function(){
+    if(window.__mb_ifr)return;window.__mb_ifr=true;
+    document.addEventListener('click',function(e){
+        var a=e.target.closest('a');if(a&&a.target==='_blank'&&a.href&&!a.href.startsWith('about:')){e.preventDefault();e.stopPropagation();try{window.parent.postMessage({type:'__mb_popup',url:a.href},'*')}catch(e){}}
+    },true);
+    var ow=window.open;
+    window.open=function(u){if(u&&typeof u==='string'){try{window.parent.postMessage({type:'__mb_popup',url:u},'*')}catch(e){}return{closed:false,close:function(){}}};return ow.apply(this,arguments)};
 })();"#;
 
 /// Linux 工具栏脚本：在主 webview 上覆盖浏览器控件
@@ -208,6 +221,8 @@ struct WebViewPool {
     content_height: f64,
     /// 标签页 URL 记录（tab_id -> url），Linux 上用于工具栏脚本
     tab_urls: HashMap<i32, String>,
+    /// 已打开开发者工具的标签页集合（切换 tab 时跟随隐藏/显示）
+    devtools_open: HashSet<i32>,
 }
 
 impl WebViewPool {
@@ -221,6 +236,7 @@ impl WebViewPool {
             content_width: 1200.0,
             content_height: 800.0,
             tab_urls: HashMap::with_capacity(MAX_TABS),
+            devtools_open: HashSet::new(),
         }
     }
 
@@ -242,6 +258,7 @@ impl WebViewPool {
         }
         self.lru_order.retain(|&id| id != tab_id);
         self.tab_urls.remove(&tab_id);
+        self.devtools_open.remove(&tab_id);
         self.webviews.remove(&tab_id)
     }
 
@@ -308,25 +325,33 @@ fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64,
     let parsed_url = url.parse::<url::Url>().map_err(|e| format!("URL 解析失败: {}", e))?;
 
     let height_script = format!("window.__mb_content_height = {};", height);
-    let init_script = CTX_MENU_SCRIPT.to_owned() + &height_script + DBL_CLICK_SCRIPT;
+    let init_script = CTX_MENU_SCRIPT.to_owned() + POPUP_SCRIPT + DBCLICK_SCRIPT + &height_script;
 
     let nav_handle = app.clone();
     let load_handle = app.clone();
     let nav_tab_id = tab_id;
     let load_tab_id = tab_id;
     let nav_app = app.clone();
+    let popup_app = app.clone();
 
     let webview_builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
-        .user_agent(&platform_user_agent())
         .initialization_script(&init_script)
-        .incognito(true)
+        .initialization_script_for_all_frames(POPUP_IFRAME_SCRIPT)
+        .initialization_script_for_all_frames(DBCLICK_SCRIPT)
+        .on_new_window(move |url, _features| {
+            let url_str = url.to_string();
+            debug_log!("[on_new_window] url={}", url_str);
+            let _ = popup_app.emit("popup://request", PopupPayload { url: url_str });
+            NewWindowResponse::Deny
+        })
         .on_navigation(move |url| {
-            debug_log!("[on_navigation] tab_id={} url={} ALLOW={}", nav_tab_id, url, true);
+            let url_str = url.to_string();
+            debug_log!("[on_navigation] tab_id={} url={} ALLOW={}", nav_tab_id, url_str, true);
             let _ = nav_app.emit(
                 "browser://url-changed",
                 UrlPayload {
                     tab_id: nav_tab_id,
-                    url: url.to_string(),
+                    url: url_str,
                 },
             );
             true
@@ -406,6 +431,14 @@ fn activate_tab(active_tab_id: i32, app: AppHandle) -> ActivateResult {
                 eprintln!("[diag] activate_tab: hiding prev tab_id={}", prev_id);
                 let _ = webview.hide();
             }
+            // Close devtools for previous tab and clean up state
+            if pool_guard.devtools_open.contains(&prev_id) {
+                if let Some(webview) = pool_guard.webviews.get(&prev_id) {
+                    eprintln!("[diag] activate_tab: closing devtools for prev tab_id={}", prev_id);
+                    let _ = webview.close_devtools();
+                }
+            }
+            pool_guard.devtools_open.remove(&prev_id);
         }
     }
 
@@ -420,7 +453,7 @@ fn activate_tab(active_tab_id: i32, app: AppHandle) -> ActivateResult {
 
     pool_guard.touch_lru(active_tab_id);
 
-    if let Some(webview) = pool_guard.webviews.get(&active_tab_id) {
+if let Some(webview) = pool_guard.webviews.get(&active_tab_id) {
         eprintln!("[diag] activate_tab: setting pos={}x{} size={}x{} then show/set_focus",
             pool_guard.content_x, pool_guard.content_y, pool_guard.content_width, pool_guard.content_height);
         let _ = webview.set_position(LogicalPosition::new(pool_guard.content_x, pool_guard.content_y));
@@ -561,22 +594,83 @@ fn go_forward_tab(tab_id: i32, app: AppHandle) {
 
 #[tauri::command]
 fn open_devtools_tab(tab_id: i32, app: AppHandle) {
-    debug_log!("[open_devtools_tab] tab_id={}", tab_id);
+    eprintln!("[open_devtools_tab] tab_id={}", tab_id);
     if cfg!(target_os = "linux") {
-        // Linux: 在主 webview 上打开开发者工具
         if let Some(wv) = app.get_webview_window("main") {
             wv.open_devtools();
         }
         return;
     }
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
-    let pool_guard = pool.lock().unwrap();
-    if let Some(webview) = pool_guard.webviews.get(&tab_id) {
-        webview.open_devtools();
+    let mut pool_guard = pool.lock().unwrap();
+
+    if pool_guard.devtools_open.contains(&tab_id) {
+        pool_guard.devtools_open.remove(&tab_id);
+        if let Some(webview) = pool_guard.webviews.get(&tab_id) {
+            eprintln!("[open_devtools_tab] closing devtools for tab_id={}", tab_id);
+            let _ = webview.close_devtools();
+        }
+    } else {
+        pool_guard.devtools_open.insert(tab_id);
+        if let Some(webview) = pool_guard.webviews.get(&tab_id) {
+            eprintln!("[open_devtools_tab] opening devtools for tab_id={}", tab_id);
+            webview.open_devtools();
+        }
+    }
+}
+
+#[tauri::command]
+fn get_settings(app: AppHandle) -> SessionSettings {
+    let settings = app.state::<Arc<Mutex<SessionSettings>>>();
+    let settings_guard = settings.lock().unwrap();
+    eprintln!("[DIAG:get_settings] return: auto_clear_on_exit={}", settings_guard.auto_clear_on_exit);
+    settings_guard.clone()
+}
+
+#[tauri::command]
+fn set_settings(settings: SessionSettings, app: AppHandle) {
+    eprintln!("[DIAG:set_settings] ENTER: auto_clear_on_exit={}", settings.auto_clear_on_exit);
+    let s = app.state::<Arc<Mutex<SessionSettings>>>();
+    let mut s_guard = s.lock().unwrap();
+    *s_guard = settings;
+}
+
+#[tauri::command]
+fn clear_browsing_data(app: AppHandle) {
+    // 清除所有活跃 webview 的 localStorage/sessionStorage
+    if !cfg!(target_os = "linux") {
+        let pool = app.state::<Arc<Mutex<WebViewPool>>>();
+        let pool_guard = pool.lock().unwrap();
+        for (_, wv) in &pool_guard.webviews {
+            let _ = wv.eval(CLEAR_JS);
+        }
+    } else {
+        if let Some(wv) = app.get_webview_window("main") {
+            let _ = wv.eval(CLEAR_JS);
+        }
     }
 }
 
 /// Linux only: 获取当前工具栏状态（标签列表 + 活跃 tab ID）
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SessionSettings {
+    auto_clear_on_exit: bool,
+}
+
+/// 清除浏览器数据的 JS 脚本（解除 webview 内 localStorage 和 sessionStorage 的绑定）
+const CLEAR_JS: &str = r#"(function(){try{localStorage.clear();sessionStorage.clear();}catch(e){}})();"#;
+
+#[derive(Clone, serde::Serialize)]
+struct PopupPayload {
+    url: String,
+}
+
+#[tauri::command]
+fn request_popup(url: String, app: AppHandle) {
+    debug_log!("[request_popup] url={}", url);
+    let _ = app.emit("popup://request", PopupPayload { url });
+}
+
 #[tauri::command]
 fn get_toolbar_state(app: AppHandle) -> ToolbarState {
     let pool = app.state::<Arc<Mutex<WebViewPool>>>();
@@ -663,6 +757,9 @@ fn resize_content_area(x: f64, y: f64, width: f64, height: f64, app: AppHandle) 
 fn main() {
     tauri::Builder::default()
         .manage(Arc::new(Mutex::new(WebViewPool::new())))
+        .manage(Arc::new(Mutex::new(SessionSettings {
+            auto_clear_on_exit: false,
+        })))
         .invoke_handler(tauri::generate_handler![
             create_tab,
             activate_tab,
@@ -674,6 +771,10 @@ fn main() {
             open_devtools_tab,
             resize_content_area,
             get_toolbar_state,
+            get_settings,
+            set_settings,
+            clear_browsing_data,
+            request_popup,
         ])
         .plugin(
             tauri::plugin::Builder::<tauri::Wry>::new("toolbar")
