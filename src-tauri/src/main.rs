@@ -10,6 +10,16 @@ use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WindowEvent,
 };
 
+/// 自定义 User-Agent：在 AppleWebKit 后追加 Safari/Chrome/Firefox 标识以通过浏览器检测
+fn user_agent() -> &'static str {
+    #[cfg(target_os = "macos")]
+    { "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Safari/603.1 Chrome/79.0.0.0 Firefox/72.0 moowcharnfu" }
+    #[cfg(target_os = "windows")]
+    { "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/605.1.15 (KHTML, like Gecko) Safari/603.1 Chrome/79.0.0.0 Firefox/72.0 moowcharnfu" }
+    #[cfg(target_os = "linux")]
+    { "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Safari/603.1 Chrome/79.0.0.0 Firefox/72.0 moowcharnfu" }
+}
+
 /// 生成当前平台的 User-Agent 字符串
 /// 调试日志：仅在 debug 构建中输出
 macro_rules! debug_log {
@@ -58,41 +68,33 @@ const CTX_MENU_SCRIPT: &str = r#"(function(){
     document.addEventListener('keydown',function(e){if(e.key==='Escape'){var m=document.getElementById('__mb_menu');if(m)m.remove()}});
 })();"#;
 
-/// 双击打开链接脚本：单击阻止导航（target=_blank 不阻止），双击触发跳转
-const DBCLICK_SCRIPT: &str = r#"(function(){
-    if(window.__mb_dbl)return;window.__mb_dbl=true;
-    var _pend=null,_tmr=null;
-    document.addEventListener('click',function(e){
-        var a=e.target.closest('a');
-        if(!a||!a.href||a.href.startsWith('about:'))return;
-        if(a.target==='_blank')return;
-        e.preventDefault();e.stopPropagation();
-        if(_pend===a){clearTimeout(_tmr);_pend=null;_tmr=null;window.location.href=a.href}
-        else{_pend=a;_tmr=setTimeout(function(){_pend=null;_tmr=null},300)}
-    },true);
-})();"#;
-
-/// Popup 处理脚本：仅主 frame 使用，直接 IPC + 接收 iframe 的 postMessage
-/// 也接收 iframe 通过 postMessage 中继的 popup 请求
+/// Popup 处理脚本：主 frame 使用原生 window.open 触发 on_new_window Rust 回调
+/// 不依赖 __TAURI_INTERNALS__.invoke（避免页面 CSP 拦截 ipc://）
+/// 同时接收 iframe 通过 postMessage 中继的 popup 请求
 const POPUP_SCRIPT: &str = r#"(function(){
     if(window.__mb_popup)return;window.__mb_popup=true;
-    if(!window.__TAURI_INTERNALS__)return;
-    function ipc(m,a){try{window.__TAURI_INTERNALS__.invoke(m,a).catch(function(){})}catch(e){}}
     var ow=window.open;
-    window.open=function(u){if(u&&typeof u==='string'){ipc('request_popup',{url:u});return{closed:false,close:function(){}}};return ow.apply(this,arguments)};
-    document.addEventListener('click',function(e){
-        var a=e.target.closest('a');if(a&&a.target==='_blank'&&a.href&&!a.href.startsWith('about:')){e.preventDefault();e.stopPropagation();ipc('request_popup',{url:a.href})}
-    },true);
+    window.open=function(u,t,f){
+        if(u&&typeof u==='string'){
+            var r=ow.call(window,u,t||'_blank',f);
+            return r||{closed:false,close:function(){}};
+        }
+        return ow.apply(this,arguments);
+    };
     window.addEventListener('message',function(e){
         var d=e.data||{};
-        // popup relay from iframe
-        if(d.type==='__mb_popup'&&d.url&&window.__TAURI_INTERNALS__){ipc('request_popup',{url:d.url})}
+        if(d.type==='__mb_popup'&&d.url){
+            var w=window.open;
+            if(w)w(d.url,'_blank');
+        }
     });
 })();"#;
 
 /// 注入所有 frame 的轻量脚本：iframe 内的 target=_blank / window.open → postMessage 到父 frame
+/// 主 frame 中跳过（主 frame 由 POPUP_SCRIPT 处理，避免 capture 阶段 stopPropagation 干扰页面元素事件）
 const POPUP_IFRAME_SCRIPT: &str = r#"(function(){
     if(window.__mb_ifr)return;window.__mb_ifr=true;
+    try{if(window.self===window.top)return}catch(e){}
     document.addEventListener('click',function(e){
         var a=e.target.closest('a');if(a&&a.target==='_blank'&&a.href&&!a.href.startsWith('about:')){e.preventDefault();e.stopPropagation();try{window.parent.postMessage({type:'__mb_popup',url:a.href},'*')}catch(e){}}
     },true);
@@ -325,7 +327,7 @@ fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64,
     let parsed_url = url.parse::<url::Url>().map_err(|e| format!("URL 解析失败: {}", e))?;
 
     let height_script = format!("window.__mb_content_height = {};", height);
-    let init_script = CTX_MENU_SCRIPT.to_owned() + POPUP_SCRIPT + DBCLICK_SCRIPT + &height_script;
+    let init_script = CTX_MENU_SCRIPT.to_owned() + POPUP_SCRIPT + &height_script;
 
     let nav_handle = app.clone();
     let load_handle = app.clone();
@@ -335,9 +337,9 @@ fn create_tab(tab_id: i32, url: String, x: f64, y: f64, width: f64, height: f64,
     let popup_app = app.clone();
 
     let webview_builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
+        .user_agent(user_agent())
         .initialization_script(&init_script)
         .initialization_script_for_all_frames(POPUP_IFRAME_SCRIPT)
-        .initialization_script_for_all_frames(DBCLICK_SCRIPT)
         .on_new_window(move |url, _features| {
             let url_str = url.to_string();
             debug_log!("[on_new_window] url={}", url_str);
