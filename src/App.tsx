@@ -32,7 +32,7 @@ export default function App() {
     const [loading, setLoading] = useState(false);
     const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
     const [settings, setSettings] = useState({ auto_clear_on_exit: false });
-    const [clearFeedback, setClearFeedback] = useState('');
+    const [clearFeedback, setClearFeedback] = useState<'idle' | 'clearing' | 'done'>('idle');
 
     const activeTab = tabs.find((t) => t.id === activeTabId);
 
@@ -313,9 +313,10 @@ export default function App() {
 
     // 清除缓存
     const handleClearCache = useCallback(async () => {
+        setClearFeedback('clearing');
         await invoke('clear_browsing_data');
-        setClearFeedback('缓存已清除');
-        setTimeout(() => setClearFeedback(''), 2000);
+        setClearFeedback('done');
+        setTimeout(() => setClearFeedback('idle'), 2000);
     }, []);
 
     const clearAddress = useCallback(() => {
@@ -646,9 +647,7 @@ export default function App() {
                     <div style={{ width: 14, height: 14, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: settings.auto_clear_on_exit ? 16 : 2, transition: 'left 0.15s' }} />
                   </div>
                 </div>
-                <button onClick={handleClearCache} style={{ padding: '4px 10px', border: 'none', borderRadius: 5, background: '#6366f1', color: '#fff', fontSize: 11, cursor: 'pointer' }}>
-                  {clearFeedback || '清除缓存'}
-                </button>
+                <button onClick={handleClearCache} style={{ padding: '4px 10px', border: 'none', borderRadius: 5, background: clearFeedback === 'done' ? '#22c55e' : clearFeedback === 'clearing' ? '#6366f1' : '#6366f1', color: '#fff', fontSize: 11, cursor: 'pointer', opacity: clearFeedback === 'clearing' ? 0.7 : 1 }}>{clearFeedback === 'done' ? '✓ 已清除' : clearFeedback === 'clearing' ? '清除中...' : '清除缓存'}</button>
               </div>
             )}
 

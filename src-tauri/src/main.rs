@@ -155,7 +155,7 @@ const TOOLBAR_SCRIPT: &str = r#";(function(){
     var gb=document.createElement('button');gb.textContent='→';gb.style.cssText='width:28px;height:28px;border:none;background:#6366f1;color:#fff;border-radius:6px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;flex-shrink:0;';
     gb.onclick=function(){var v=u.value.trim();if(v)nav(v)};
     nb.appendChild(gb);
-    nb.appendChild(bt('🔧',function(){window.location.href='about:blank?__mb_devtools='+activeId;}));
+    nb.appendChild(bt('🐞',function(){window.location.href='about:blank?__mb_devtools='+activeId;}));
     d.appendChild(nb);
     // Welcome page for about:blank (including about:blank?__mb_new=... and __mb_close=...)
     if(L.startsWith('about:blank')){
@@ -639,16 +639,16 @@ fn set_settings(settings: SessionSettings, app: AppHandle) {
 
 #[tauri::command]
 fn clear_browsing_data(app: AppHandle) {
-    // 清除所有活跃 webview 的 localStorage/sessionStorage
+    // 清除所有活跃 webview 的 localStorage/sessionStorage/cookies
     if !cfg!(target_os = "linux") {
         let pool = app.state::<Arc<Mutex<WebViewPool>>>();
         let pool_guard = pool.lock().unwrap();
         for (_, wv) in &pool_guard.webviews {
-            let _ = wv.eval(CLEAR_JS);
+            let _ = wv.eval(CLEAR_ALL_JS);
         }
     } else {
         if let Some(wv) = app.get_webview_window("main") {
-            let _ = wv.eval(CLEAR_JS);
+            let _ = wv.eval(CLEAR_ALL_JS);
         }
     }
 }
@@ -659,8 +659,8 @@ struct SessionSettings {
     auto_clear_on_exit: bool,
 }
 
-/// 清除浏览器数据的 JS 脚本（解除 webview 内 localStorage 和 sessionStorage 的绑定）
-const CLEAR_JS: &str = r#"(function(){try{localStorage.clear();sessionStorage.clear();}catch(e){}})();"#;
+/// 清除浏览器数据的 JS 脚本：localStorage + sessionStorage + cookies
+const CLEAR_ALL_JS: &str = r#"(function(){try{localStorage.clear();sessionStorage.clear();document.cookie.split(';').forEach(function(c){var n=c.split('=')[0].trim();if(n)document.cookie=n+'=;expires=Thu, 01 Jan 1970 00:00:00 UTC;path=/';});}catch(e){}})();"#;
 
 #[derive(Clone, serde::Serialize)]
 struct PopupPayload {
@@ -829,10 +829,18 @@ fn main() {
                                 if let Some(pos) = url.find("__mb_devtools=") {
                                     if let Ok(_devtools_id) = url[pos + "__mb_devtools=".len()..].split('&').next().unwrap_or_default().parse::<i32>() {
                                         eprintln!("[diag] toolbar: URL_DEVTOOLS id={}", _devtools_id);
+                                        let current_url = pool_guard.active_tab_id
+                                            .and_then(|id| pool_guard.tab_urls.get(&id))
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        drop(pool_guard);
                                         if let Some(wv) = webview.app_handle().get_webview_window("main") {
                                             wv.open_devtools();
                                         }
-                                        let _ = webview.eval("window.history.back()");
+                                        if !current_url.is_empty() && current_url != "about:blank" {
+                                            let escaped = current_url.replace('\'', "\\'");
+                                            let _ = webview.eval(&format!("window.location.href = '{}';", escaped));
+                                        }
                                         return;
                                     }
                                 }
@@ -872,7 +880,26 @@ fn main() {
             let close_app = app.handle().clone();
             window.on_window_event(move |event| {
                 if let WindowEvent::CloseRequested { .. } = event {
-                    debug_log!("[on_window_event::CloseRequested] cleaning up child webviews");
+                    debug_log!("[on_window_event::CloseRequested] cleaning up");
+
+                    // 检查 auto_clear_on_exit 设置
+                    let settings = close_app.state::<Arc<Mutex<SessionSettings>>>();
+                    if settings.lock().unwrap().auto_clear_on_exit {
+                        debug_log!("[on_window_event::CloseRequested] auto_clear_on_exit enabled, clearing browsing data");
+                        if cfg!(target_os = "linux") {
+                            if let Some(wv) = close_app.get_webview_window("main") {
+                                let _ = wv.eval(CLEAR_ALL_JS);
+                            }
+                        } else {
+                            let pool = close_app.state::<Arc<Mutex<WebViewPool>>>();
+                            let pool_guard = pool.lock().unwrap();
+                            for (_, w) in &pool_guard.webviews {
+                                let _ = w.eval(CLEAR_ALL_JS);
+                            }
+                        }
+                    }
+
+                    // 关闭所有子 webview
                     let pool = close_app.state::<Arc<Mutex<WebViewPool>>>();
                     let pool_guard = pool.lock().unwrap();
                     for (_, w) in &pool_guard.webviews {
