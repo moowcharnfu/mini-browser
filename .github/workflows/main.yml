@@ -113,7 +113,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: bundle-*
-          merge-multiple: true
+          # merge-multiple: true
           path: ./release-assets
 
       - name: List Downloaded Assets
