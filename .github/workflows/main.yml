@@ -67,11 +67,39 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
         run: npm run tauri build
 
-      - name: Upload bundle
+      - name: Upload bundle(exe)
         uses: actions/upload-artifact@v4
         with:
-          name: bundle-${{ matrix.bundle }}.zip
-          path: src-tauri/target/release/bundle/**
+          name: bundle-${{ matrix.bundle }}.exe
+          path: src-tauri/target/release/bundle/**/*.exe
+          if-no-files-found: warn
+
+      - name: Upload bundle(dmg)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.bundle }}.dmg
+          path: src-tauri/target/release/bundle/**/*.dmg
+          if-no-files-found: warn
+
+      - name: Upload bundle(AppImage)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.bundle }}.AppImage
+          path: src-tauri/target/release/bundle/**/*.AppImage
+          if-no-files-found: warn
+
+      - name: Upload bundle(deb)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.bundle }}.deb
+          path: src-tauri/target/release/bundle/**/*.deb
+          if-no-files-found: warn
+
+      - name: Upload bundle(rpm)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.bundle }}.rpm
+          path: src-tauri/target/release/bundle/**/*.rpm
           if-no-files-found: warn
 
   release:
