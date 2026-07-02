@@ -74,7 +74,7 @@ jobs:
           path: src-tauri/target/release/bundle/**/*.exe
           if-no-files-found: warn
 
-      - name: Upload bundle(dmg)
+      - name: Upload bundle(dmg-${{ matrix.bundle }})
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.bundle }}.dmg
@@ -158,6 +158,7 @@ jobs:
         with:
           files: |
             ./release-assets/*
+            ./release-assets/**/*
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           body: |
