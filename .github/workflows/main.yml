@@ -78,13 +78,15 @@ jobs:
     name: Create GitHub Release
     needs: build-tauri
     runs-on: ubuntu-latest
+    # 可选：如果坚持使用 GITHUB_TOKEN，需在此处声明 permissions: contents: write
+    # 但使用 PAT 时，权限由 PAT 本身的 scope 决定，此处可不写或保留默认
     steps:
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: bundle-*
           merge-multiple: true
-          path: ./release-assets # 明确指定下载路径
+          path: ./release-assets
 
       - name: List Assets
         run: ls -l ./release-assets
@@ -92,10 +94,14 @@ jobs:
       - name: Generate Checksums
         run: |
           cd ./release-assets
-          # 使用 find 命令处理所有文件，避免通配符问题
-          find . -type f -name "*.exe" -o -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" -o -name "*.zip" -o -name "*.tar.gz" | while read file; do
-            sha256sum "$file"
-          done > checksums.txt
+          # 初始化 checksums 文件
+          > checksums.txt
+          # 遍历常见安装包格式生成 sha256
+          for file in *.exe *.dmg *.deb *.AppImage *.zip *.tar.gz; do
+            if [ -f "$file" ]; then
+              sha256sum "$file" >> checksums.txt
+            fi
+          done
           
           # 显示校验和内容以便调试
           cat checksums.txt
@@ -105,12 +111,11 @@ jobs:
         with:
           files: |
             ./release-assets/*
-            ./release-assets/checksums.txt
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           body: |
             Automated release for ${{ github.ref_name }}.
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 关键修改：使用 PAT 令牌
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
