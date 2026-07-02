@@ -65,7 +65,7 @@ jobs:
       - name: Build Tauri app
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
-        run: npm run tauri:build
+        run: npm run tauri build
 
       - name: Upload bundle
         uses: actions/upload-artifact@v4
