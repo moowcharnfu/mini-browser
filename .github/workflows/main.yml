@@ -33,7 +33,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -65,7 +65,7 @@ jobs:
       - name: Build Tauri app
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
-        run: npm run tauri build
+        run: npm run tauri:build
 
       - name: Upload bundle
         uses: actions/upload-artifact@v4
@@ -88,23 +88,42 @@ jobs:
           merge-multiple: true
           path: ./release-assets
 
-      - name: List Assets
-        run: ls -l ./release-assets
+      - name: List Downloaded Assets
+        run: |
+          echo "下载的资产文件："
+          find ./release-assets -type f -exec ls -lh {} \;
 
       - name: Generate Checksums
         run: |
           cd ./release-assets
-          # 初始化 checksums 文件
+          
+          # 列出所有文件
+          echo "当前目录文件列表："
+          ls -la
+          
+          # 创建校验和文件
           > checksums.txt
-          # 遍历常见安装包格式生成 sha256
-          for file in *.exe *.dmg *.deb *.AppImage *.zip *.tar.gz; do
-            if [ -f "$file" ]; then
+          
+          # 处理所有非校验和文件
+          file_count=0
+          for file in *; do
+            if [ -f "$file" ] && [ "$file" != "checksums.txt" ]; then
+              echo "为文件 '$file' 生成校验和..."
               sha256sum "$file" >> checksums.txt
+              file_count=$((file_count + 1))
             fi
           done
           
-          # 显示校验和内容以便调试
+          if [ $file_count -eq 0 ]; then
+            echo "警告：没有找到任何资产文件，创建占位符"
+            echo "no_assets_available" > placeholder.txt
+            sha256sum placeholder.txt >> checksums.txt
+            rm placeholder.txt
+          fi
+          
+          echo "生成的校验和："
           cat checksums.txt
+          echo "文件大小：" $(wc -c < checksums.txt) "字节"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -115,6 +134,11 @@ jobs:
           name: Release ${{ github.ref_name }}
           body: |
             Automated release for ${{ github.ref_name }}.
+            
+            &zwnj;**校验和：**&zwnj;
+            ```
+            $(cat ./release-assets/checksums.txt)
+            ```
           draft: false
           prerelease: false
           # 关键修改：使用 PAT 令牌
