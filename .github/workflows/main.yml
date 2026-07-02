@@ -84,15 +84,28 @@ jobs:
         with:
           pattern: bundle-*
           merge-multiple: true
+          path: ./release-assets # 明确指定下载路径
+
+      - name: List Assets
+        run: ls -l ./release-assets
 
       - name: Generate Checksums
-        run: sha256sum * > checksums.txt
+        run: |
+          cd ./release-assets
+          # 使用 find 命令处理所有文件，避免通配符问题
+          find . -type f -name "*.exe" -o -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" -o -name "*.zip" -o -name "*.tar.gz" | while read file; do
+            sha256sum "$file"
+          done > checksums.txt
+          
+          # 显示校验和内容以便调试
+          cat checksums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            *
+            ./release-assets/*
+            ./release-assets/checksums.txt
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           body: |
