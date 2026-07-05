@@ -40,6 +40,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Add macOS targets
+        if: startsWith(matrix.platform, 'macos')
+        working-directory: repo
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
+          rustup target list --installed
+
       - name: Install dependencies (Ubuntu only)
         if: matrix.platform == 'ubuntu-latest'
         run: |
@@ -57,54 +65,71 @@ jobs:
           echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> $GITHUB_ENV
 
       - name: Install frontend dependencies
+        working-directory: repo
         run: npm install
 
       - name: Build frontend
+        working-directory: repo
         run: npm run build
 
       - name: Build Tauri app
+        if: ${{ !startsWith(matrix.platform, 'macos') }}
+        working-directory: repo
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
-        run: npm run tauri build
+        run: npm run tauri:build
 
+      - name: Build Tauri app(macos)
+        if: startsWith(matrix.platform, 'macos')
+        working-directory: repo
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: npm run tauri:build -- --target universal-apple-darwin # -- --target多一个--避免认为是npm参数
+        
       - name: List Build bundle
+        working-directory: repo
         run: |
           echo "构建的文件："
-          ls -R src-tauri/target/release/bundle/
+          ls -R src-tauri/target/
 
       - name: Upload bundle(exe)
+        if: startsWith(matrix.bundle, 'windows')
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.bundle }}.exe
-          path: src-tauri/target/release/bundle/**/*.exe
+          path: repo/src-tauri/target/release/bundle/**/*.exe
           if-no-files-found: warn
 
       - name: Upload bundle(dmg-${{ matrix.bundle }})
+        if: startsWith(matrix.bundle, 'macos')
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.bundle }}.dmg
-          path: src-tauri/target/release/bundle/**/*.dmg
+          path: repo/src-tauri/target/**/release/bundle/**/*.dmg
           if-no-files-found: warn
 
       - name: Upload bundle(AppImage)
+        if: startsWith(matrix.bundle, 'linux')
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.bundle }}.AppImage
-          path: src-tauri/target/release/bundle/**/*.AppImage
+          path: repo/src-tauri/target/release/bundle/**/*.AppImage
           if-no-files-found: warn
 
       - name: Upload bundle(deb)
+        if: startsWith(matrix.bundle, 'linux')
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.bundle }}.deb
-          path: src-tauri/target/release/bundle/**/*.deb
+          path: repo/src-tauri/target/release/bundle/**/*.deb
           if-no-files-found: warn
 
       - name: Upload bundle(rpm)
+        if: startsWith(matrix.bundle, 'linux')
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.bundle }}.rpm
-          path: src-tauri/target/release/bundle/**/*.rpm
+          path: repo/src-tauri/target/release/bundle/**/*.rpm
           if-no-files-found: warn
 
   release:
