@@ -49,13 +49,13 @@ jobs:
           node-version: '24'
 
       - name: Setup Rust
-        if: ${{ !startsWith(matrix.platform, 'universal-') }}
+        if: ${{ !startsWith(matrix.bundle_name, 'universal-') }}
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Setup Rust
-        if: startsWith(matrix.platform, 'universal-')
+        if: startsWith(matrix.bundle_name, 'universal-')
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
@@ -95,7 +95,7 @@ jobs:
       # --- 关键修改：构建步骤 ---
       - name: Build Tauri App
         working-directory: ./
-        if: ${{ !startsWith(matrix.platform, 'universal-') }}
+        if: ${{ !startsWith(matrix.bundle_name, 'universal-') }}
         run: |          
           # 执行构建，指定 Target
           # 注意：这里不需要双重 --，npm run script -- args 会自动传递
@@ -103,7 +103,7 @@ jobs:
 
       # --- 关键修改：构建步骤 ---
       - name: Build Tauri App
-        if: startsWith(matrix.platform, 'universal-')
+        if: startsWith(matrix.bundle_name, 'universal-')
         working-directory: ./
         run: |          
           # 执行构建，指定 Target
