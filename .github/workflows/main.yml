@@ -22,7 +22,7 @@ jobs:
             bundle_name: windows-x64
 
           # macOS Intel (原生构建 x86_64)
-          - platform: macos-15-intel # macos-15-inte 是 Intel 芯片
+          - platform: macos-15-intel # macos-15-intel 是 Intel 芯片
             target: x86_64-apple-darwin
             bundle_name: macos-x64
             deployment_target: '10.15'
@@ -32,11 +32,11 @@ jobs:
             target: aarch64-apple-darwin
             bundle_name: macos-arm64
             deployment_target: '11.0'
-            
-          # macOS Universal (在 Apple Silicon 机器上构建，兼容性好)
-          - platform: macos-14 
+
+          # macOS Apple Silicon (原生构建)
+          - platform: macos-latest 
             target: universal-apple-darwin
-            bundle_name: macos-universal
+            bundle_name: universal-macos
             deployment_target: '11.0'
 
     runs-on: ${{ matrix.platform }}
@@ -85,13 +85,23 @@ jobs:
         working-directory: ./
         run: npm run build
 
-      # --- 关键修改：统一的构建步骤 ---
+      # --- 关键修改：构建步骤 ---
       - name: Build Tauri App
         working-directory: ./
+        if: ${{ !startsWith(matrix.platform, 'universal-') }}
         run: |          
           # 执行构建，指定 Target
           # 注意：这里不需要双重 --，npm run script -- args 会自动传递
           npm run tauri build -- --target ${{ matrix.target }}
+
+      # --- 关键修改：构建步骤 ---
+      - name: Build Tauri App
+        if: startsWith(matrix.platform, 'universal-')
+        working-directory: ./
+        run: |          
+          # 执行构建，指定 Target
+          # 注意：这里不需要双重 --，npm run script -- args 会自动传递
+          npm run tauri build -- --target universal-apple-darwin
 
       # --- 调试步骤：确认文件生成 ---
       - name: Check Build Output
