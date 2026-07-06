@@ -79,6 +79,13 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
         run: npm run tauri build
 
+      - name: Build Tauri app(macos x86_64-apple-darwin)
+        if: startsWith(matrix.platform, 'macos')
+        working-directory: ./
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: npm run tauri build -- --target x86_64-apple-darwin
+
       - name: Build Tauri app(macos)
         if: startsWith(matrix.platform, 'macos')
         working-directory: ./
