@@ -22,7 +22,7 @@ jobs:
             bundle_name: windows-x64
 
           # macOS Intel (原生构建 x86_64)
-          - platform: macos-13 # macos-13 是 Intel 芯片
+          - platform: macos-15-intel # macos-15-inte 是 Intel 芯片
             target: x86_64-apple-darwin
             bundle_name: macos-x64
             deployment_target: '10.15'
@@ -88,11 +88,8 @@ jobs:
       # --- 关键修改：统一的构建步骤 ---
       - name: Build Tauri App
         working-directory: ./
-        run: |
-          # 1. 清理之前的构建产物，防止冲突
-          rm -rf src-tauri/target/release/bundle 
-          
-          # 2. 执行构建，指定 Target
+        run: |          
+          # 执行构建，指定 Target
           # 注意：这里不需要双重 --，npm run script -- args 会自动传递
           npm run tauri build -- --target ${{ matrix.target }}
 
