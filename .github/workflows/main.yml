@@ -49,9 +49,16 @@ jobs:
           node-version: '24'
 
       - name: Setup Rust
+        if: ${{ !startsWith(matrix.platform, 'universal-') }}
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Setup Rust
+        if: startsWith(matrix.platform, 'universal-')
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
 
       - name: Add macOS targets
         if: startsWith(matrix.platform, 'macos')
