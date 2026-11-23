@@ -67,11 +67,15 @@ npm run test           # 全部测试
 | 平台 | 产物路径 |
 |------|---------|
 | macOS | `src-tauri/target/release/bundle/macos/mini-browser.app` |
-| macOS | `src-tauri/target/release/bundle/dmg/mini-browser_1.0.0_x64.dmg` |
-| Windows | `src-tauri/target/release/bundle/msi/mini-browser_1.0.0_x64.msi` |
-| Windows | `src-tauri/target/release/bundle/nsis/mini-browser_1.0.0_x64-setup.exe` |
-| Linux | `src-tauri/target/release/bundle/deb/mini-browser_1.0.0_amd64.deb` |
-| Linux | `src-tauri/target/release/bundle/appimage/mini-browser_1.0.0_amd64.AppImage` |
+| macOS | `src-tauri/target/release/bundle/dmg/mini-browser_<版本>_x64.dmg` |
+| Windows | `src-tauri/target/release/bundle/msi/mini-browser_<版本>_x64.msi` |
+| Windows | `src-tauri/target/release/bundle/nsis/mini-browser_<版本>_x64-setup.exe` |
+| Linux | `src-tauri/target/release/bundle/deb/mini-browser_<版本>_amd64.deb` |
+| Linux | `src-tauri/target/release/bundle/appimage/mini-browser_<版本>_amd64.AppImage` |
+
+> **注意**：打包必须在**项目根目录**执行 `npm run tauri build`。在 `src-tauri/` 目录里直接跑
+> `npx tauri build` 会因 `src-tauri/package.json` 的 build 脚本指向 `tauri build` 而无限递归
+> （该脚本已改为防递归守卫，会直接报错退出）。
 
 注意：平台打包必须在该平台上执行，不支持交叉编译。
 
@@ -93,12 +97,19 @@ Mini Browser 使用**双架构方案**，根据平台自适应：
 
 Linux 上 GTK 子 webview 有兼容性问题 + `__TAURI_INTERNALS__.invoke()` 在外部页面不可用，使用完全不同的架构：
 
-- **不创建子 webview**，只有一个主 webview 直接显示页面
-- 工具栏通过 `tauri::plugin::Builder::on_page_load` 回调在每次页面加载时注入
-- 所有 tab 操作通过 URL 参数传递（不用 IPC）：`about:blank?__mb_new/__mb_close/__mb_switch/__mb_devtools=ID`
-- Rust 侧维护 `WebViewPool`（`tab_urls: HashMap` + `lru_order: VecDeque`），每次注入时序列化为 JS 内联数据
+- **主窗口由 Rust 创建**（`tauri.conf.json` 中 `create:false`）：设置伪装 User-Agent，并通过
+  `on_new_window` 把 `window.open` 转成应用内新标签页
+- **不创建子 webview**，只有一个主 webview 直接显示页面；React 界面在首次导航后即被页面替换
+- 工具栏通过 `tauri::plugin::Builder::on_page_load` 注入，并有 **2 秒周期的兜底重注入线程**
+  （部分站点 load 事件不触发 Finished；页面自行清空 body 时也能自愈）
+- 所有 tab 操作通过 URL 参数传递（不用 IPC）：
+  `about:blank?__mb_nav/__mb_back/__mb_forward/__mb_switch/__mb_close/__mb_new/__mb_devtools/__mb_clear_cache/__mb_autoclear`
+- 历史由 Rust 侧按标签维护（`TabState`：`history` 栈 + 游标），不依赖 webview 全局历史——
+  避免协议跳转残留导致后退死循环、以及多标签共用一个 webview 时的历史串台
+- 导航归属用 `pending_nav` 绑定：页面加载事件到达时可能已切换标签，按归属标签记账
+- 状态每次注入时写入 `window.__MB_STATE__`，脚本按签名比对决定是否重建（不打断用户输入）
 - Tab ID 使用 Rust 原子计数器（起始 1000，避免与 React IPC ID 冲突）
-- React 前端在 Linux 上跳过子 webview 相关逻辑
+- 应用自身页面（dev server / 自定义协议）按精确 URL 前缀识别，避免把 `localhost:PORT` 本地站点误判
 
 技术栈：React + TypeScript + Vite（前端），Tauri v2 + Rust（后端），系统原生 WebView（WebKit / WebView2 / WebKitGTK）
 

@@ -2,29 +2,22 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import {
+    Tab,
+    BLANK_URL,
+    defaultTab,
+    deriveTabTitle,
+    isBlankUrl,
+    nextTabId,
+    pickNextActiveTab,
+    pushHistory,
+} from './utils/tab';
 
 const appWindow = getCurrentWindow();
 const isLinux = navigator.userAgent.includes('Linux');
 
 const TABBAR_HEIGHT = 36;
 const TOOLBAR_HEIGHT = 44;
-
-interface Tab {
-    id: number;
-    title: string;
-    url: string;
-    history: string[];
-    historyIndex: number;
-    addressInput: string;
-}
-
-function newTabId(tabs: Tab[]): number {
-    return Math.max(0, ...tabs.map((t) => t.id)) + 1;
-}
-
-function defaultTab(id: number): Tab {
-    return { id, title: '新标签页', url: 'about:blank', history: ['about:blank'], historyIndex: 0, addressInput: '' };
-}
 
 export default function App() {
     const [tabs, setTabs] = useState<Tab[]>([]);
@@ -41,31 +34,27 @@ export default function App() {
     const activeTabIdRef = useRef(activeTabId);
     activeTabIdRef.current = activeTabId;
     const contentRef = useRef<HTMLDivElement>(null);
-    const initRef = useRef(false);
 
     // Listen for URL changes from content webviews
     useEffect(() => {
         const unlisten = listen<{ tab_id: number; url: string }>('browser://url-changed', (e) => {
             const { tab_id, url } = e.payload;
             setTabs((prev) =>
-                prev.map((t) =>
-                    t.id === tab_id
-                        ? {
-                              ...t,
-                              url,
-                              title: url === 'about:blank' ? '新标签页' : url,
-                              history: t.history[t.historyIndex] === url
-                                  ? t.history
-                                  : [...t.history.slice(0, t.historyIndex + 1), url],
-                              historyIndex: t.history[t.historyIndex] === url
-                                  ? t.historyIndex
-                                  : t.historyIndex + 1,
-                          }
-                        : t,
-                ),
+                prev.map((t) => {
+                    if (t.id !== tab_id) return t;
+                    const next = pushHistory(t.history, t.historyIndex, url);
+                    return {
+                        ...t,
+                        url,
+                        title: deriveTabTitle(url),
+                        addressInput: url,
+                        history: next.history,
+                        historyIndex: next.historyIndex,
+                    };
+                }),
             );
         });
-        return () => { unlisten.then((f) => f()); };
+        return () => { unlisten.then((f) => f()).catch(() => {}); };
     }, []);
 
     // Listen for loading state
@@ -76,7 +65,15 @@ export default function App() {
                 setLoading(isLoading);
             }
         });
-        return () => { unlisten.then((f) => f()); };
+        return () => { unlisten.then((f) => f()).catch(() => {}); };
+    }, []);
+
+    // 初始标签：挂载即创建，避免首帧 activeTabId 与标签 id 不一致导致地址栏不可输入
+    useEffect(() => {
+        const id = nextTabId([]);
+        console.log('[diag] init: setting state for tab', { id });
+        setTabs([defaultTab(id)]);
+        setActiveTabId(id);
     }, []);
 
     // ResizeObserver: sync content area position to Rust
@@ -101,17 +98,6 @@ export default function App() {
 
         const observer = new ResizeObserver(() => {
             sendContentSize().catch(console.error);
-            if (initRef.current) return;
-            initRef.current = true;
-
-            // 首次创建初始 tab — 不创建 webview，仅设置 React 状态
-            // webview 在用户首次导航到真实 URL 时由 ensureWebview 创建
-            requestAnimationFrame(() => {
-                const id = newTabId([]);
-                console.log('[diag] init: setting state for tab', { id });
-                setTabs([defaultTab(id)]);
-                setActiveTabId(id);
-            });
         });
         observer.observe(el);
         return () => observer.disconnect();
@@ -123,7 +109,7 @@ export default function App() {
         // Linux 没有子 webview，所有页面在主 webview 中加载
         if (isLinux) return false;
         const tab = tabsRef.current.find((t) => t.id === tabId);
-        if (tab && tab.url === 'about:blank') {
+        if (tab && isBlankUrl(tab.url)) {
             console.log('[diag] ensureWebview: about:blank, skip webview creation');
             return false;
         }
@@ -133,7 +119,7 @@ export default function App() {
             const rect = el?.getBoundingClientRect();
             await invoke('create_tab', {
                 tabId,
-                url: tab?.url ?? 'about:blank',
+                url: tab?.url ?? BLANK_URL,
                 x: Math.round(rect?.left ?? 0),
                 y: Math.round(rect?.top ?? 0),
                 width: Math.round(rect?.width ?? 1200),
@@ -145,30 +131,25 @@ export default function App() {
         return false;
     }, []);
 
+    // 导航：地址栏输入的原始文本交给 Rust 归一化（URL / 搜索词判定只有一份实现）
     const navigate = useCallback(async (url?: string) => {
         const tab = tabsRef.current.find((t) => t.id === activeTabIdRef.current);
-        const raw = url ?? tab?.addressInput.trim();
+        const raw = (url ?? tab?.addressInput ?? '').trim();
         if (!raw || !tab) return;
 
-        let target = raw;
-        if (!raw.match(/^https?:\/\//)) {
-            target = raw.includes('.')
-                ? 'https://' + raw
-                : 'https://www.google.com/search?q=' + encodeURIComponent(raw);
-        }
-
-        setTabs((prev) =>
-            prev.map((t) =>
-                t.id === activeTabIdRef.current ? { ...t, addressInput: target } : t,
-            ),
-        );
         setLoading(true);
-        // Linux: 主 webview 直接导航，无需 ensureWebview
-        if (!isLinux) {
-            await ensureWebview(activeTabIdRef.current);
+        try {
+            // Linux: 主 webview 直接导航，无需 ensureWebview
+            if (!isLinux) {
+                await ensureWebview(activeTabIdRef.current);
+            }
+            await invoke('navigate_to_url', { tabId: activeTabIdRef.current, url: raw });
+        } catch (err) {
+            // 导航失败（如达到标签上限）必须复位 loading，否则进度条永久显示
+            console.error('[diag] navigate failed:', err);
+            setLoading(false);
         }
-        await invoke('navigate_to_url', { tabId: activeTabIdRef.current, url: target });
-    }, []);
+    }, [ensureWebview]);
 
     const reload = useCallback(async () => {
         setLoading(true);
@@ -200,10 +181,10 @@ export default function App() {
     }, []);
 
     const newTab = useCallback(async (url?: string) => {
-        const id = newTabId(tabsRef.current);
-        if (url && url !== 'about:blank') {
+        const id = nextTabId(tabsRef.current);
+        if (url && !isBlankUrl(url)) {
             // 弹出窗口/新标签页：直接创建带 URL 的 tab
-            setTabs((prev) => [...prev, { ...defaultTab(id), url, addressInput: url, title: url }]);
+            setTabs((prev) => [...prev, { ...defaultTab(id), url, addressInput: url, title: deriveTabTitle(url) }]);
             setActiveTabId(id);
             setLoading(true);
             // 确保 webview 已创建再导航（非 Linux）
@@ -226,25 +207,23 @@ export default function App() {
             console.log('[diag] popup://request received url=' + url);
             newTab(url);
         });
-        return () => { unlisten.then((f) => f()); };
+        return () => { unlisten.then((f) => f()).catch(() => {}); };
     }, [newTab]);
 
     const closeTab = useCallback(async (id: number) => {
         const currentTabs = tabsRef.current;
         if (currentTabs.length <= 1) return;
-        const idx = currentTabs.findIndex((t) => t.id === id);
+        const next = pickNextActiveTab(currentTabs, id);
         await invoke('close_tab', { tabId: id });
         setTabs((prev) => prev.filter((t) => t.id !== id));
         if (id === activeTabIdRef.current) {
-            const next = idx > 0 ? currentTabs[idx - 1] : currentTabs[idx + 1];
             if (next) {
                 setActiveTabId(next.id);
-                setLoading(next.url !== 'about:blank');
+                setLoading(!isBlankUrl(next.url));
                 if (isLinux) {
-                    if (next.url !== 'about:blank') {
+                    // Linux: 导航由 Rust 侧负责（Linux 上 React 界面在首次导航后已不存在）
+                    if (!isBlankUrl(next.url)) {
                         await invoke('navigate_to_url', { tabId: next.id, url: next.url });
-                    } else if (window.location.href !== 'about:blank') {
-                        window.location.href = 'about:blank';
                     }
                 } else {
                     await ensureWebview(next.id);
@@ -256,10 +235,10 @@ export default function App() {
     const switchTab = useCallback(async (id: number, url?: string) => {
         setActiveTabId(id);
         if (url !== undefined) {
-            setLoading(url !== 'about:blank');
+            setLoading(!isBlankUrl(url));
         }
         if (isLinux) {
-            if (url && url !== 'about:blank') {
+            if (url && !isBlankUrl(url)) {
                 await invoke('navigate_to_url', { tabId: id, url });
             }
         } else {
@@ -322,7 +301,9 @@ export default function App() {
     const clearAddress = useCallback(() => {
         const id = activeTabIdRef.current;
         setTabs((prev) =>
-            prev.map((t) => (t.id === id ? { ...t, addressInput: '' } : t)),
+            prev.map((t) =>
+                t.id === id ? { ...t, addressInput: '' } : t,
+            ),
         );
     }, []);
 
@@ -348,7 +329,7 @@ export default function App() {
                 }
             }
         });
-        return () => { unlisten.then((f) => f()); };
+        return () => { unlisten.then((f) => f()).catch(() => {}); };
     }, []);
 
     // URL 变化时：保持 webview 始终可见（不隐藏），确保尺寸和位置正确
@@ -364,7 +345,7 @@ export default function App() {
         const rect = el.getBoundingClientRect();
         const tabId = activeTab.id;
         console.log('[diag] urlEffect: url=' + activeTab.url + ' rect=' + JSON.stringify({ x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) }));
-        if (activeTab.url === 'about:blank') {
+        if (isBlankUrl(activeTab.url)) {
             // about:blank 时不隐藏 webview，直接 resize 保持可见
             console.log('[diag] urlEffect: about:blank, keeping webview visible');
             invoke('resize_content_area', {
@@ -441,6 +422,8 @@ export default function App() {
                     {tabs.map((tab) => (
                         <div
                             key={tab.id}
+                            data-testid="tab"
+                            className={tab.id === activeTabId ? 'active' : undefined}
                             onClick={() => switchTab(tab.id, tab.url)}
                             style={{
                                 display: 'flex',
@@ -468,6 +451,7 @@ export default function App() {
                                 {tab.title}
                             </span>
                             <button
+                                data-testid="close-tab"
                                 onClick={(e) => {
                                     e.stopPropagation();
                                     closeTab(tab.id);
@@ -493,6 +477,7 @@ export default function App() {
                     ))}
                 </div>
                 <button
+                    data-testid="new-tab-button"
                     onClick={() => newTab()}
                     style={{
                         width: 26,
@@ -527,19 +512,19 @@ export default function App() {
                     height: TOOLBAR_HEIGHT,
                 }}
             >
-                <button onClick={goBack} style={{ ...navBtn, opacity: activeTab && activeTab.historyIndex > 0 ? 1 : 0.3 }}>
+                <button data-testid="back-button" onClick={goBack} style={{ ...navBtn, opacity: activeTab && activeTab.historyIndex > 0 ? 1 : 0.3 }}>
                     ←
                 </button>
-                <button onClick={goForward} style={{ ...navBtn, opacity: activeTab && activeTab.historyIndex < activeTab.history.length - 1 ? 1 : 0.3 }}>
+                <button data-testid="forward-button" onClick={goForward} style={{ ...navBtn, opacity: activeTab && activeTab.historyIndex < activeTab.history.length - 1 ? 1 : 0.3 }}>
                     →
                 </button>
-                <button onClick={reload} style={navBtn}>
+                <button data-testid="reload-button" onClick={reload} style={navBtn}>
                     ↻
                 </button>
-                <button onClick={() => setSettingsPanelOpen((v) => !v)} style={{ ...navBtn, background: settingsPanelOpen ? '#2d2d52' : 'transparent' }}>
+                <button data-testid="settings-toggle" onClick={() => setSettingsPanelOpen((v) => !v)} style={{ ...navBtn, background: settingsPanelOpen ? '#2d2d52' : 'transparent' }}>
                     🔧
                 </button>
-                <button onClick={openDevtools} style={navBtn}>
+                <button data-testid="devtools-button" onClick={openDevtools} style={navBtn}>
                     🐞
                 </button>
 
@@ -560,6 +545,7 @@ export default function App() {
                 >
                     <span style={{ color: '#606080', fontSize: 13 }}>🔒</span>
                     <input
+                        data-testid="address-bar"
                         value={activeTab?.addressInput ?? ''}
                         onChange={handleAddressInputChange}
                         onKeyDown={handleAddressKeyDown}
@@ -574,6 +560,7 @@ export default function App() {
                         }}
                     />
                     <button
+                        data-testid="go-button"
                         onClick={() => navigate()}
                         style={{
                             width: 28,
@@ -593,6 +580,7 @@ export default function App() {
                     </button>
                     {activeTab?.addressInput && (
                         <button
+                            data-testid="clear-address"
                             onClick={clearAddress}
                             style={{
                                 width: 18,
@@ -631,6 +619,7 @@ export default function App() {
             {/* 设置面板 — 内联在工具栏和内容之间，高于内容区域且不会被 webview 遮挡 */}
             {settingsPanelOpen && (
               <div
+                data-testid="settings-panel"
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -643,28 +632,33 @@ export default function App() {
               >
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <span style={{ fontSize: 11, color: '#e8e8f0' }}>退出清除</span>
-                  <div onClick={toggleAutoClear} style={{ width: 32, height: 18, borderRadius: 9, cursor: 'pointer', background: settings.auto_clear_on_exit ? '#6366f1' : '#2d2d4a', position: 'relative', flexShrink: 0 }}>
+                  <div
+                    data-testid="auto-clear-toggle"
+                    onClick={toggleAutoClear}
+                    style={{ width: 32, height: 18, borderRadius: 9, cursor: 'pointer', background: settings.auto_clear_on_exit ? '#6366f1' : '#2d2d4a', position: 'relative', flexShrink: 0 }}
+                  >
                     <div style={{ width: 14, height: 14, borderRadius: '50%', background: '#fff', position: 'absolute', top: 2, left: settings.auto_clear_on_exit ? 16 : 2, transition: 'left 0.15s' }} />
                   </div>
                 </div>
-                <button onClick={handleClearCache} style={{ padding: '4px 10px', border: 'none', borderRadius: 5, background: clearFeedback === 'done' ? '#22c55e' : clearFeedback === 'clearing' ? '#6366f1' : '#6366f1', color: '#fff', fontSize: 11, cursor: 'pointer', opacity: clearFeedback === 'clearing' ? 0.7 : 1 }}>{clearFeedback === 'done' ? '✓ 已清除' : clearFeedback === 'clearing' ? '清除中...' : '清除缓存'}</button>
+                <button data-testid="clear-cache" onClick={handleClearCache} style={{ padding: '4px 10px', border: 'none', borderRadius: 5, background: clearFeedback === 'done' ? '#22c55e' : '#6366f1', color: '#fff', fontSize: 11, cursor: 'pointer', opacity: clearFeedback === 'clearing' ? 0.7 : 1 }}>{clearFeedback === 'done' ? '✓ 已清除' : clearFeedback === 'clearing' ? '清除中...' : '清除缓存'}</button>
               </div>
             )}
 
             {/* 内容区域 — 嵌入的 webview 会精确覆盖此区域 */}
             <div
                 ref={contentRef}
+                data-testid="content-area"
                 style={{
                     flex: 1,
                     marginTop: 30,
                     marginLeft: 10,
                     marginRight: 10,
-                    border: activeTab?.url === 'about:blank' ? '1px solid #2d2d4a' : 'none',
-                    borderRadius: activeTab?.url === 'about:blank' ? 8 : 0,
-                    background: activeTab?.url === 'about:blank' ? '#0f0f1a' : 'transparent',
+                    border: activeTab && isBlankUrl(activeTab.url) ? '1px solid #2d2d4a' : 'none',
+                    borderRadius: activeTab && isBlankUrl(activeTab.url) ? 8 : 0,
+                    background: activeTab && isBlankUrl(activeTab.url) ? '#0f0f1a' : 'transparent',
                 }}
             >
-                {(!activeTab || activeTab.url === 'about:blank') && !loading && (
+                {(!activeTab || isBlankUrl(activeTab.url)) && !loading && (
                     <div style={{
                         display: 'flex',
                         alignItems: 'center',

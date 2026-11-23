@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tauri dev",
-    "build": "tauri build",
+    "dev": "echo \"[src-tauri] 请在项目根目录运行: npm run tauri dev\" && exit 1",
+    "build": "echo \"[src-tauri] 请在项目根目录运行: npm run tauri build\" && exit 1",
     "tauri": "tauri"
   },
   "dependencies": {

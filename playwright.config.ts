@@ -8,7 +8,7 @@ export default defineConfig({
   workers: 1,
   reporter: [['html', { outputFolder: 'test-results/report' }]],
   use: {
-    baseURL: 'http://localhost:1420',
+    baseURL: 'http://localhost:1421',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },

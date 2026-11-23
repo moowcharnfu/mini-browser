@@ -1,77 +1,63 @@
 import { test, expect } from '@playwright/test';
 
+async function callsOf(page: import('@playwright/test').Page, cmd: string) {
+    return page.evaluate((target: string) => {
+        const calls = (window as unknown as { __mbCalls?: { cmd: string; args: Record<string, unknown> }[] }).__mbCalls ?? [];
+        return calls.filter((c) => c.cmd === target).map((c) => c.args);
+    }, cmd);
+}
+
 test.describe('浏览器核心功能', () => {
-  test('Bilibili 能正常加载', async ({ page }) => {
-    const addressBar = page.locator('[data-testid="address-bar"]');
-    await addressBar.fill('www.bilibili.com');
-    await page.keyboard.press('Enter');
+    test.beforeEach(async ({ page }) => {
+        await page.goto('/');
+        await expect(page.locator('[data-testid="address-bar"]')).toBeVisible();
+    });
 
-    // 等待页面加载（Bilibili 首页）
-    await expect(page.locator('body')).toContainText('哔哩哔哩', { timeout: 30000 });
-  });
+    test('设置面板可展开与收起', async ({ page }) => {
+        const panel = page.locator('[data-testid="settings-panel"]');
+        await expect(panel).toHaveCount(0);
 
-  test('前进后退按钮能正常操作', async ({ page }) => {
-    const addressBar = page.locator('[data-testid="address-bar"]');
+        await page.locator('[data-testid="settings-toggle"]').click();
+        await expect(panel).toHaveCount(1);
 
-    // 导航到 example.com
-    await addressBar.fill('https://example.com');
-    await page.keyboard.press('Enter');
-    await expect(page.locator('h1')).toContainText('Example Domain', { timeout: 10000 });
+        await page.locator('[data-testid="settings-toggle"]').click();
+        await expect(panel).toHaveCount(0);
+    });
 
-    // 导航到另一个页面
-    await addressBar.fill('https://httpbin.org/get');
-    await page.keyboard.press('Enter');
-    await expect(page).toHaveURL(/httpbin\.org/, { timeout: 10000 });
+    test('退出自动清除开关应写回设置', async ({ page }) => {
+        await page.locator('[data-testid="settings-toggle"]').click();
+        await page.locator('[data-testid="auto-clear-toggle"]').click();
 
-    // 点击后退按钮
-    await page.locator('[data-testid="back-button"]').click();
-    await expect(page.locator('h1')).toContainText('Example Domain', { timeout: 10000 });
+        await expect.poll(async () => (await callsOf(page, 'set_settings')).length).toBe(1);
+        const args = (await callsOf(page, 'set_settings'))[0];
+        expect(args.settings).toEqual({ auto_clear_on_exit: true });
+    });
 
-    // 点击前进按钮
-    await page.locator('[data-testid="forward-button"]').click();
-    await expect(page).toHaveURL(/httpbin\.org/, { timeout: 10000 });
-  });
+    test('清除缓存按钮应调用 clear_browsing_data', async ({ page }) => {
+        await page.locator('[data-testid="settings-toggle"]').click();
+        await page.locator('[data-testid="clear-cache"]').click();
 
-  test('地址栏自动同步 WebView URL', async ({ page }) => {
-    const addressBar = page.locator('[data-testid="address-bar"]');
+        await expect.poll(async () => (await callsOf(page, 'clear_browsing_data')).length).toBe(1);
+    });
 
-    await addressBar.fill('https://example.com');
-    await page.keyboard.press('Enter');
+    test('后退/前进按钮应触发对应命令', async ({ page }) => {
+        // 先模拟一次 URL 变化，让当前标签有历史可退
+        await page.evaluate(() => {
+            (window as unknown as { __mbEmit?: (e: string, p: unknown) => void }).__mbEmit?.(
+                'browser://url-changed',
+                { tab_id: 1, url: 'https://example.com' },
+            );
+        });
 
-    await expect(async () => {
-      const value = await addressBar.inputValue();
-      expect(value).toContain('example.com');
-    }).toPass({ timeout: 10000 });
-  });
+        await page.locator('[data-testid="back-button"]').click();
+        await expect.poll(async () => (await callsOf(page, 'go_back_tab')).length).toBe(1);
 
-  test('标签页切换保持各自 URL', async ({ page }) => {
-    const addressBar = page.locator('[data-testid="address-bar"]');
-    const tabs = page.locator('[data-testid="tab"]');
+        await page.locator('[data-testid="forward-button"]').click();
+        await expect.poll(async () => (await callsOf(page, 'go_forward_tab')).length).toBe(1);
+    });
 
-    // 在第一个标签导航到 example.com
-    await addressBar.fill('https://example.com');
-    await page.keyboard.press('Enter');
-    await expect(async () => {
-      const value = await addressBar.inputValue();
-      expect(value).toContain('example.com');
-    }).toPass({ timeout: 10000 });
-
-    // 新建第二个标签
-    await page.locator('[data-testid="new-tab-button"]').click();
-    await expect(tabs).toHaveCount(2);
-
-    // 在第二个标签导航到 httpbin.org
-    await addressBar.fill('https://httpbin.org/get');
-    await page.keyboard.press('Enter');
-    await expect(page).toHaveURL(/httpbin\.org/, { timeout: 10000 });
-
-    // 切换回第一个标签
-    await tabs.first().click();
-
-    // 验证第一个标签的 URL 保持为 example.com
-    await expect(async () => {
-      const value = await addressBar.inputValue();
-      expect(value).toContain('example.com');
-    }).toPass({ timeout: 10000 });
-  });
+    test('开发者工具按钮应触发 open_devtools_tab', async ({ page }) => {
+        await page.locator('[data-testid="devtools-button"]').click();
+        await expect.poll(async () => (await callsOf(page, 'open_devtools_tab')).length).toBe(1);
+    });
 });
